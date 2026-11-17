@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="zh-Hans">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="app-version" content="0.5.4">
+<title>Class Never Deafing 使用指南</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --background: #f7f9fc;
+    --surface: #fff;
+    --text: #142434;
+    --secondary: #43596e;
+    --accent: #145b72;
+    --rule: #d5dfe9;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --background: #111b25;
+      --surface: #1a2835;
+      --text: #ecf3fa;
+      --secondary: #b4c5d6;
+      --accent: #8ed7e8;
+      --rule: #374957;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--background);
+    color: var(--text);
+    font-family: "Source Sans 3", -apple-system, BlinkMacSystemFont, sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+  }
+  main { max-width: 750px; margin: 0 auto; padding: 30px 30px 40px; }
+  header { border-top: 4px solid var(--accent); padding-top: 15px; }
+  h1 { font-size: 1.85rem; line-height: 1.25; margin: 0; }
+  h2 { font-size: 1.2rem; margin: 26px 0 8px; }
+  p { margin: 7px 0 12px; }
+  ul, ol { margin: 8px 0 0; padding-left: 1.55rem; }
+  li + li { margin-top: 7px; }
+  nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 18px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 10px 14px;
+    border-radius: 8px;
+  }
+  a { color: var(--accent); }
+  code { font-size: 0.9em; overflow-wrap: anywhere; }
+  .version { color: var(--secondary); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Class Never Deafing 使用指南</h1>
+    <p class="version">适用于 0.5.4 · Apple Silicon Mac · macOS 14 或更高版本</p>
+    <p>用一个悬浮窗同时看实时原文和译文，结束后自动保存双语文本。</p>
+  </header>
+
+  <nav aria-label="章节">
+    <a href="#start">首次使用</a>
+    <a href="#record">录制和切换语言</a>
+    <a href="#appearance">字幕外观</a>
+    <a href="#models">选择模型</a>
+    <a href="#save">保存字幕</a>
+    <a href="#troubleshooting">排查问题</a>
+  </nav>
+
+  <section id="start">
+    <h2>首次使用</h2>
+    <ol>
+      <li>在 Finder 打开 <strong>Class Never Deafing.app</strong>。右键点击菜单栏的字幕气泡图标，选择倒数第二项「设置」。</li>
+      <li>在「OpenAI API」输入你自己的 OpenAI 项目 API Key，点「存入钥匙串」。如果钥匙串暂时不可用，可点「仅本次使用」，退出 App 后需要重新输入。</li>
+      <li>右键点击菜单栏图标，在「输入源」子菜单选择系统默认麦克风、已连接的耳机或外接麦克风，或者「系统声音（扬声器／耳机输出）」。播放中的线上课程可用「系统声音」。也可在设置的「音频输入」中选择。输入更改在下一次开始录制时生效。</li>
+      <li>点击开始图标。按 macOS 提示允许麦克风访问，或在「隐私与安全性 → 屏幕与系统音频录制」中允许系统声音访问。授予权限后，若 macOS 提示重启 App，请退出后重开。</li>
+    </ol>
+  </section>
+
+  <section id="record">
+    <h2>录制和切换语言</h2>
+    <ul>
+      <li>顶部一行包含状态圆点、两个语言菜单、按秒计时、开始、暂停／继续、停止和置顶。绿色表示正在采音，橙色表示暂停，蓝色表示连接或收尾，红色表示出错。鼠标停留时可查看状态和按钮含义。</li>
+      <li>源语言默认「自动检测」，目标语言默认「普通话（简体中文）」。录制中可直接点顶部菜单切换。源语言从下一段生效，目标语言用于下一次提交翻译的段落。</li>
+      <li>字幕原文在上，译文在下。正常每一到两句翻译一次，连续讲话最多约 12 秒提交一次。暂停会冻结计时，继续时沿用当前课堂的字幕。</li>
+    </ul>
+  </section>
+
+  <section id="appearance">
+    <h2>字幕外观</h2>
+    <p>在设置的「原文字幕字体（如英文）」和「译文字幕字体（如中文）」中，可分别设置字号、字体样式、粗体、斜体和颜色。点对应的颜色色块选择，点「恢复自动颜色」可随字幕窗背景恢复自动配色。</p>
+    <p>「字幕窗」可调整背景颜色、透明度和置顶。新字幕会在接近底部时跟随滚动并预留一行，向上翻看时会保留当前位置。</p>
+  </section>
+
+  <section id="models">
+    <h2>选择模型</h2>
+    <p>在「设置 → 模型」分别选择转写和翻译模型，下一次开始录制时生效。</p>
+    <ul>
+      <li><strong>转写</strong>默认使用 GPT-Live-Transcribe。GPT-Transcribe 会在每段提交之后开始转写。</li>
+      <li><strong>翻译</strong>默认使用 GPT-6 Luna，也可选 GPT-6.1 Terra、GPT-6.1 Sol、GPT-6 Astra、GPT-5.4 mini 或 GPT-4.1 mini。</li>
+      <li>要使用其他 OpenAI 文本模型，选「自定义」并填写完整模型 ID。模型需要支持 Responses API 的文本流式输出，你的 API 项目也需要具有该模型的访问权限。</li>
+    </ul>
+  </section>
+
+  <section id="save">
+    <h2>保存字幕</h2>
+    <p>点击停止后，App 收尾并自动写入一个 UTF-8 <code>.txt</code>。点字幕窗文件夹图标可在 Finder 中定位。也可从菜单栏选择「另存本节课文本」。</p>
+    <p>在「设置 → 保存」选择默认目录。首次默认使用 <code>~/Library/Application Support/课堂字幕/课堂记录/</code>。导出保留原文和译文，未完成的译文会有标记。</p>
+  </section>
+
+  <section id="troubleshooting">
+    <h2>排查问题</h2>
+    <ul>
+      <li><strong>钥匙串报错</strong>时，可以解锁「登录」钥匙串后重试，或用「仅本次使用」。</li>
+      <li><strong>有声音但无字幕</strong>时，先确认是否选了正确的音频输入，再检查系统权限、网络和 API Key。</li>
+      <li><strong>原文有字但译文失败</strong>时，检查翻译模型 ID、项目权限和 OpenAI API 额度。改用项目可用的模型后，开始新一节录制。</li>
+      <li>从菜单栏右键菜单的倒数第二项打开「设置」，滚动到设置底部可找到「使用指南」和「详情」。退出 App 请选右键菜单的最后一项「退出」。「详情」显示版本、构建号、系统要求和本版更新内容。</li>
+    </ul>
+    <p>转写和翻译通过 OpenAI API 处理。所选输入的音频和待译文本会发往 OpenAI。App 在停止后保存双语文本，原始音频不会写入磁盘。</p>
+  </section>
+</main>
+</body>
+</html>

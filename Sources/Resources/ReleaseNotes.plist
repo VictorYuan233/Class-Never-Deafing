@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>version</key>
+    <string>0.5.4</string>
+    <key>highlights</key>
+    <array>
+        <string>精简右键菜单，移除顶部状态行，底部依次放置「设置」和「退出」。</string>
+    </array>
+</dict>
+</plist>
