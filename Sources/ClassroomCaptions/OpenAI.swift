@@ -162,7 +162,7 @@ final class RealtimeConnection {
                     finalize(item, text: result.text, failed: result.failed)
                 }
             case "conversation.item.input_audio_transcription.delta":
-                guard let text = object["delta"] as? String else { return }
+                guard let text = object["delta"] as? String, !text.isEmpty else { return }
                 if let segment = items[item] {
                     emit(.delta(segment, text))
                 } else {
@@ -194,7 +194,7 @@ enum TranslationAPI {
         model: TranslationConfiguration,
         previous: String?,
         key: String,
-        onDelta: (String) -> Void
+        onDelta: @MainActor (String) -> Void
     ) async throws -> String {
         var request = URLRequest(url: URL(string: "https://api.openai.com/v1/responses")!)
         request.httpMethod = "POST"
@@ -203,6 +203,7 @@ enum TranslationAPI {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         request.httpBody = try requestBody(original, to: target, model: model, previous: previous)
+        let startedAt = ContinuousClock.now
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             AppLog.event("openai.translation.http_error", number: http.statusCode)
@@ -216,6 +217,7 @@ enum TranslationAPI {
             throw AppFailure.fromAPI(code: error?["code"] as? String ?? "", type: error?["type"] as? String ?? "", status: http.statusCode)
         }
         var text = ""
+        var reportedFirstText = false
         for try await line in bytes.lines {
             guard line.hasPrefix("data:") else { continue }
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
@@ -223,9 +225,13 @@ enum TranslationAPI {
                   let type = event["type"] as? String else { continue }
             switch type {
             case "response.output_text.delta":
-                if let delta = event["delta"] as? String {
+                if let delta = event["delta"] as? String, !delta.isEmpty {
+                    if !reportedFirstText {
+                        reportedFirstText = true
+                        AppLog.latency("translation.first_text_ms", since: startedAt)
+                    }
                     text += delta
-                    onDelta(delta)
+                    await onDelta(delta)
                 }
             case "response.output_text.done":
                 if let final = event["text"] as? String { text = final }
@@ -233,6 +239,7 @@ enum TranslationAPI {
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw AppFailure.api("翻译未返回文字。", retryable: true)
                 }
+                AppLog.latency("translation.complete_ms", since: startedAt)
                 return text
             case "error", "response.failed", "response.incomplete":
                 let details = event["response"] as? [String: Any]

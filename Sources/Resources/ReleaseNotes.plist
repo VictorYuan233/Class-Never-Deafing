@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>0.5.7</string>
+    <string>0.5.8</string>
     <key>highlights</key>
     <array>
-        <string>钥匙串读取移到后台，开始转写时可取消等待或在超时后改用临时 Key。</string>
-        <string>新增诊断日志。容量上限为 1 MiB，超出时自动淘汰最早的记录。</string>
+        <string>合并短音频包，并平滑原文和译文的流式刷新，减少片段积压和界面重绘。</string>
+        <string>诊断日志新增音频发送等待、转写定稿和翻译首字耗时。</string>
     </array>
 </dict>
 </plist>

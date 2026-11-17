@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="app-version" content="0.5.7">
+<meta name="app-version" content="0.5.8">
 <title>Class Never Deafing 使用指南</title>
 <style>
   :root {
@@ -59,7 +59,7 @@
 <main>
   <header>
     <h1>Class Never Deafing 使用指南</h1>
-    <p class="version">适用于 0.5.7 · Apple Silicon Mac · macOS 14 或更高版本</p>
+    <p class="version">适用于 0.5.8 · Apple Silicon Mac · macOS 14 或更高版本</p>
     <p>用一个悬浮窗同时看实时原文和译文，结束后自动保存双语文本。</p>
   </header>
 
@@ -133,7 +133,7 @@
   </section>
   <section id="diagnostics">
     <h2>诊断日志</h2>
-    <p>在「设置 → 诊断日志」点「在 Finder 中显示日志」。文件位于 <code>~/Library/Logs/Class Never Deafing/diagnostics.log</code>，记录 App 启动、钥匙串等待、音频权限、连接和保存结果。排查时可根据点击开始的时间查看附近记录。</p>
+    <p>在「设置 → 诊断日志」点「在 Finder 中显示日志」。文件位于 <code>~/Library/Logs/Class Never Deafing/diagnostics.log</code>，记录 App 启动、钥匙串等待、音频权限、连接和保存结果。原文和译文一起停顿时，可查看同一时间附近的音频发送等待、转写定稿和译文首字耗时。这些数值以毫秒计。</p>
     <p>日志上限为 1 MiB。超过时，App 会删除最早的完整记录并保留最近的记录。日志不包含 API Key、音频、原文或译文。</p>
   </section>
 </main>

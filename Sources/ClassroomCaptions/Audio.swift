@@ -10,6 +10,42 @@ enum AudioEvent {
     case commit
 }
 
+struct QueuedAudioEvent {
+    let event: AudioEvent
+    let queuedAt: ContinuousClock.Instant
+}
+
+struct AudioPacketBatcher {
+    static let packetBytes = 4 * SpeechSegmenter.bytesPerFrame
+    private var isFirstPacket = true
+    private var buffered = Data()
+    private var bufferedAt: ContinuousClock.Instant?
+
+    mutating func append(_ event: AudioEvent, now: ContinuousClock.Instant) -> [QueuedAudioEvent] {
+        switch event {
+        case .audio(let data):
+            if isFirstPacket {
+                isFirstPacket = false
+                return [QueuedAudioEvent(event: .audio(data), queuedAt: now)]
+            }
+            if buffered.isEmpty { bufferedAt = now }
+            buffered.append(data)
+            return buffered.count >= Self.packetBytes ? flush() : []
+        case .commit:
+            isFirstPacket = true
+            return flush() + [QueuedAudioEvent(event: .commit, queuedAt: now)]
+        }
+    }
+
+    private mutating func flush() -> [QueuedAudioEvent] {
+        guard let bufferedAt else { return [] }
+        let packet = QueuedAudioEvent(event: .audio(buffered), queuedAt: bufferedAt)
+        buffered = Data()
+        self.bufferedAt = nil
+        return [packet]
+    }
+}
+
 struct SpeechSegmenter {
     static let samplesPerFrame = 480
     static let bytesPerFrame = samplesPerFrame * 2
@@ -136,7 +172,7 @@ struct AudioInput: Identifiable {
     }
 }
 
-typealias AudioEvents = AsyncThrowingStream<AudioEvent, Error>
+typealias AudioEvents = AsyncThrowingStream<QueuedAudioEvent, Error>
 
 @MainActor
 final class AudioCapture {
@@ -255,10 +291,12 @@ final class AudioCapture {
 final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     let queue = DispatchQueue(label: "classroom-captions.audio", qos: .userInitiated)
     private let slots = DispatchSemaphore(value: 24)
-    private let stream = AudioEvents.makeStream(bufferingPolicy: .bufferingOldest(850))
+    // Keep roughly the former queue duration with 80 ms packets.
+    private let stream = AudioEvents.makeStream(bufferingPolicy: .bufferingOldest(210))
     private let output = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)!
     private var converter: AVAudioConverter?
     private var segmenter = SpeechSegmenter()
+    private var packetBatcher = AudioPacketBatcher()
     private var remainder = Data()
     private var finished = false
 
@@ -358,10 +396,14 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func emit(_ events: [AudioEvent]) {
+        guard !events.isEmpty else { return }
+        let now = ContinuousClock.now
         for event in events {
-            if case .dropped = stream.continuation.yield(event) {
-                stream.continuation.finish(throwing: AppFailure.audioOverload)
-                break
+            for packet in packetBatcher.append(event, now: now) {
+                if case .dropped = stream.continuation.yield(packet) {
+                    stream.continuation.finish(throwing: AppFailure.audioOverload)
+                    return
+                }
             }
         }
     }

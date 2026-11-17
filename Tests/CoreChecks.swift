@@ -13,12 +13,13 @@ struct CoreChecks {
         try await checkKeychainTimeout()
         try checkLogRetention()
         checkSpeechBoundaries()
+        checkAudioPacketBatching()
         checkTranslationSegments()
         try await checkSystemAudioConversion()
         checkCaptionScroll()
         checkRecordingClock()
         try checkExport()
-        print("通过：语言、字幕窗快捷键、自定义模型参数、字体颜色、临时 Key、钥匙串后台超时、日志容量和淘汰、短停顿分段与双句翻译、系统音频格式转换、字幕滚动、暂停计时、自选目录自动保存。")
+        print("通过：语言、字幕窗快捷键、自定义模型参数、字体颜色、临时 Key、钥匙串后台超时、日志容量和淘汰、短停顿分段与双句翻译、系统音频格式转换与分包、字幕滚动、暂停计时、自选目录自动保存。")
     }
 
     @MainActor private static func checkTemporaryCredential() async {
@@ -200,6 +201,33 @@ struct CoreChecks {
         precondition(commits(tail))
     }
 
+    private static func checkAudioPacketBatching() {
+        let frameSize = SpeechSegmenter.bytesPerFrame
+        let b = Data(repeating: 2, count: frameSize)
+        let first = Data(repeating: 1, count: frameSize * 9)
+        let next = Data(repeating: 3, count: frameSize)
+        let start = ContinuousClock.now
+        var batcher = AudioPacketBatcher()
+        var yielded = batcher.append(.audio(first), now: start)
+        for offset in 1...9 {
+            yielded += batcher.append(.audio(b), now: start.advanced(by: .milliseconds(offset * 20)))
+        }
+        let boundary = start.advanced(by: .milliseconds(200))
+        yielded += batcher.append(.commit, now: boundary)
+        yielded += batcher.append(.audio(next), now: boundary.advanced(by: .milliseconds(20)))
+        precondition(yielded.count == 6)
+        var beforeCommit = Data()
+        for packet in yielded.prefix(4) {
+            guard case .audio(let chunk) = packet.event else { preconditionFailure("Audio order changed") }
+            beforeCommit.append(chunk)
+        }
+        precondition(beforeCommit == first + Data(repeating: 2, count: frameSize * 9))
+        precondition(yielded[1].queuedAt == start.advanced(by: .milliseconds(20)))
+        precondition(commits([yielded[4].event]) && yielded[4].queuedAt == boundary)
+        guard case .audio(let afterCommit) = yielded[5].event else { preconditionFailure("Next turn must start immediately") }
+        precondition(afterCommit == next)
+    }
+
     private static func checkTranslationSegments() {
         let lesson = "  Dr. Tan measured 3.5 volts. Then the reading dropped. Is that expected? Check the leads. Record the value. "
         precondition(TranslationSegments.split(lesson) == [
@@ -245,8 +273,8 @@ struct CoreChecks {
         processor.finish()
         var audioBytes = 0
         var committed = false
-        for try await event in processor.events {
-            switch event {
+        for try await packet in processor.events {
+            switch packet.event {
             case .audio(let data): audioBytes += data.count
             case .commit: committed = true
             }

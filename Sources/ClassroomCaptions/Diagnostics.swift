@@ -54,6 +54,7 @@ enum AppLog {
     private static let queue = DispatchQueue(label: "classroom-captions.diagnostics", qos: .utility)
     private static let formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
+        formatter.formatOptions.insert(.withFractionalSeconds)
         formatter.timeZone = .autoupdatingCurrent
         return formatter
     }()
@@ -69,6 +70,12 @@ enum AppLog {
 
     static func event(_ name: StaticString, number: Int? = nil) {
         write(name, detail: number.map { "value=\($0)" })
+    }
+
+    static func latency(_ name: StaticString, since start: ContinuousClock.Instant) {
+        let duration = start.duration(to: .now).components
+        let milliseconds = Int(duration.seconds * 1000 + duration.attoseconds / 1_000_000_000_000_000)
+        event(name, number: milliseconds)
     }
 
     static func failure(_ name: StaticString, _ error: Error) {
