@@ -42,13 +42,10 @@ struct CaptionView: View {
                     .padding(.horizontal, 18)
                     .padding(.top, 7)
             }
-            if session.captions.isEmpty && session.liveOriginal.isEmpty {
+            if session.captions.isEmpty && session.liveDrafts.unbound.isEmpty {
                 Spacer(minLength: 0)
             } else {
                 transcript
-            }
-            if !session.liveOriginal.isEmpty {
-                liveOriginal
             }
         }
         .buttonStyle(.plain)
@@ -158,19 +155,13 @@ struct CaptionView: View {
         return ceil(font.ascender - font.descender + font.leading)
     }
 
-    private var liveOriginal: some View {
-        Text(session.liveOriginal)
+    private func liveOriginal(_ text: String) -> some View {
+        Text(text)
             .font(originalFont)
             .foregroundStyle(originalColor)
-            .lineLimit(3)
-            .truncationMode(.head)
             .fixedSize(horizontal: false, vertical: true)
             .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 18)
-            .padding(.top, 5)
-            .padding(.bottom, blankLineHeight)
-            .layoutPriority(1)
             .accessibilityIdentifier("liveOriginal")
     }
 
@@ -180,10 +171,11 @@ struct CaptionView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         LazyVStack(alignment: .leading, spacing: 13) {
-                            ForEach(session.captions) { caption in
-                                if !caption.original.isEmpty || caption.originalFailed {
-                                    captionRow(caption)
-                                }
+                            ForEach(Caption.visibleRows(session.captions, drafts: session.liveDrafts.bound)) { caption in
+                                captionRow(caption)
+                            }
+                            ForEach(session.liveDrafts.unbound) { draft in
+                                liveOriginal(draft.text)
                             }
                         }
                         .padding(.horizontal, 18)
@@ -410,6 +402,15 @@ struct SettingsView: View {
                 }
                 .accessibilityValue(preferences.segmentationLength.title)
                 Text("\(preferences.segmentationLength.detail)。下次开始转写时生效。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Section("自动暂停") {
+                Toggle("无声时自动暂停", isOn: $preferences.silencePauseEnabled)
+                Stepper("无声时长：\(preferences.silencePauseMinutes) 分钟", value: $preferences.silencePauseMinutes,
+                        in: SilenceAutoPause.minutes)
+                    .disabled(!preferences.silencePauseEnabled)
+                Text("达到无声时长后停止采音和计时，点击「继续」可接着转写。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

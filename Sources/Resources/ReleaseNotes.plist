@@ -3,10 +3,12 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>0.6.4</string>
+    <string>0.6.5</string>
     <key>highlights</key>
     <array>
-        <string>设置新增「记录诊断日志」开关。关闭后停止记录，已保存的日志仍可查看。</string>
+        <string>实时原文可完整换行，并与尚待翻译的段落一起滚动查看。</string>
+        <string>连续的「此段未能转写」合并成一行。</string>
+        <string>设置新增无声自动暂停，可设定等待时间，手动继续同一场转写。</string>
     </array>
 </dict>
 </plist>

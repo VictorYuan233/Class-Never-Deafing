@@ -20,11 +20,13 @@ struct CoreChecks {
         checkTranscriptionRecoveryRequest()
         checkRecoveryAmplification()
         checkTranscriptDrafts()
+        checkFailureRows()
+        checkSoundActivity()
         try await checkSystemAudioConversion()
         checkCaptionScroll()
         checkRecordingClock()
         try checkExport()
-        print("通过：语言、字幕窗快捷键、自定义模型参数、字体颜色、临时 Key、钥匙串后台超时、日志容量和淘汰、轻声检测、可调分句、Fast 翻译与补识别请求、系统音频格式转换与分包、实时原文交接和字幕滚动、暂停计时、自选目录自动保存。")
+        print("通过：语言、字幕窗快捷键、自定义模型参数、字体颜色、临时 Key、钥匙串后台超时、日志容量和淘汰、轻声检测、可调分句、Fast 翻译与补识别请求、系统音频格式转换与分包、多段实时原文、失败提示合并、字幕滚动、静音检测与暂停计时、自选目录自动保存。")
     }
 
     private static func checkTranscriptDrafts() {
@@ -32,26 +34,53 @@ struct CoreChecks {
         let retired = UUID()
         let first = UUID()
         let second = UUID()
-        let indices = [first: 0, second: 1]
         var drafts = TranscriptDrafts()
-        func liveText() -> String { drafts.newest(activeConnection: connection, indices: indices) }
 
         drafts.append("First", connection: connection, item: "item_1")
         drafts.bind(connection: connection, item: "item_1", to: first)
-        precondition(liveText() == "First")
+        precondition(drafts.snapshot().bound[first] == "First")
         drafts.append("Next", connection: connection, item: "item_2")
         drafts.append(" segment", connection: connection, item: "item_2")
         drafts.append(" segment", to: first)
         drafts.append("Retired text", connection: retired, item: "item_2")
-        precondition(liveText() == "Next segment")
+        drafts.append("  ", connection: connection, item: "blank")
+        precondition(drafts.snapshot().unbound.map(\.text) == ["Next segment", "Retired text"])
+        precondition(drafts.snapshot().bound[first] == "First segment")
         drafts.bind(connection: connection, item: "item_2", to: second)
         drafts.append(" continues", to: second)
-        precondition(liveText() == "Next segment continues")
+        precondition(drafts.snapshot().bound[second] == "Next segment continues")
         let oldText = drafts.remove(first)
-        precondition(oldText == "First segment" && liveText() == "Next segment continues")
+        precondition(oldText == "First segment" && drafts.snapshot().bound[second] == "Next segment continues")
         drafts.remove(connection: retired)
         drafts.remove(second)
-        precondition(liveText().isEmpty)
+        precondition(drafts.snapshot() == TranscriptDrafts.Snapshot())
+    }
+
+    private static func checkFailureRows() {
+        let firstFailure = Caption(originalFailed: true)
+        let missedAgain = Caption(originalFailed: true)
+        let newSpeech = Caption()
+        let nextFailure = Caption(originalFailed: true)
+        let captions = [firstFailure, Caption(), missedAgain, newSpeech, nextFailure, Caption(originalFailed: true)]
+        let rows = Caption.visibleRows(captions, drafts: [newSpeech.id: "Still speaking."])
+        precondition(rows.map(\.id) == [firstFailure.id, newSpeech.id, nextFailure.id])
+        precondition(rows[1].original == "Still speaking." && !rows[1].originalFinal)
+        precondition(Caption.visibleRows(captions, drafts: [:]).map(\.id) == [firstFailure.id])
+    }
+
+    private static func checkSoundActivity() {
+        let start = SuspendingClock().now
+        var activity = SoundActivity()
+        activity.ingest(audible: true, at: start)
+        activity.ingest(audible: false, at: start.advanced(by: .milliseconds(20)))
+        precondition(activity.lastHeardAt == nil)
+        for frame in 2...5 {
+            activity.ingest(audible: true, at: start.advanced(by: .milliseconds(frame * 20)))
+        }
+        precondition(activity.lastHeardAt == start.advanced(by: .milliseconds(100)))
+        activity.ingest(audible: true, at: start.advanced(by: .milliseconds(120)))
+        activity.ingest(audible: false, at: start.advanced(by: .seconds(5)))
+        precondition(activity.lastHeardAt == start.advanced(by: .milliseconds(120)))
     }
 
     @MainActor private static func checkTemporaryCredential() async {

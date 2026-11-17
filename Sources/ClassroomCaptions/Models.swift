@@ -39,13 +39,35 @@ struct Caption: Identifiable {
     var originalFailed = false
     var translationFailed = false
     var translationLanguage = Language.simplified
+
+    static func visibleRows(_ captions: [Caption], drafts: [UUID: String]) -> [Caption] {
+        var lastRowWasFailure = false
+        return captions.compactMap { caption in
+            var row = caption
+            if row.original.isEmpty, let text = drafts[row.id] { row.original = text }
+            if !row.original.isEmpty {
+                lastRowWasFailure = false
+                return row
+            }
+            guard row.originalFailed, !lastRowWasFailure else { return nil }
+            lastRowWasFailure = true
+            return row
+        }
+    }
 }
 
 struct TranscriptDrafts {
-    private struct Draft {
+    struct Draft: Identifiable, Equatable {
         let connection: UUID
         let item: String
         var text: String
+
+        var id: String { "\(connection):\(item)" }
+    }
+
+    struct Snapshot: Equatable {
+        var unbound: [Draft] = []
+        var bound: [UUID: String] = [:]
     }
 
     private var unbound: [Draft] = []
@@ -82,13 +104,17 @@ struct TranscriptDrafts {
         unbound.removeAll { $0.connection == connection }
     }
 
-    func newest(activeConnection: UUID?, indices: [UUID: Int]) -> String {
-        if let newest = unbound.last(where: { $0.connection == activeConnection }) {
-            return newest.text
-        }
-        let newest = bound.keys.max { indices[$0, default: -1] < indices[$1, default: -1] }
-        return newest.flatMap { bound[$0] } ?? ""
+    func snapshot() -> Snapshot {
+        Snapshot(
+            unbound: unbound.filter { $0.text.contains { !$0.isWhitespace } },
+            bound: bound.filter { $0.value.contains { !$0.isWhitespace } }
+        )
     }
+}
+
+enum SilenceAutoPause {
+    static let minutes = 1...120
+    static let defaultMinutes = 5
 }
 
 enum SegmentationLength: Int, CaseIterable {

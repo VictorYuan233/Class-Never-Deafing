@@ -3,6 +3,7 @@ import Foundation
 import AudioToolbox
 import CoreAudio
 import CoreMedia
+import os
 import ScreenCaptureKit
 
 enum AudioEvent {
@@ -16,6 +17,21 @@ struct SpeechBoundary {
 
     // Eight 20 ms frames are enough evidence to flag a possibly missed short word.
     var hasSustainedSignal: Bool { voicedFrames >= 8 }
+}
+
+struct SoundActivity {
+    private(set) var lastHeardAt: SuspendingClock.Instant?
+    private var audibleFrames = 0
+
+    mutating func ingest(audible: Bool, at now: @autoclosure () -> SuspendingClock.Instant = SuspendingClock().now) {
+        guard audible else {
+            audibleFrames = 0
+            return
+        }
+        // Require 80 ms of activity so an isolated click does not reset the timer.
+        if audibleFrames < 4 { audibleFrames += 1 }
+        if audibleFrames == 4 { lastHeardAt = now() }
+    }
 }
 
 struct QueuedAudioEvent {
@@ -241,6 +257,7 @@ final class AudioCapture {
     private var screenStream: SCStream?
     private var screenStarting = false
     private var stopped = false
+    var lastHeardAt: SuspendingClock.Instant? { processor.lastHeardAt }
 
     init(inputID: String, length: SegmentationLength) {
         self.inputID = inputID
@@ -362,6 +379,7 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     private var signalFrames = 0
     private var signalPeak = 0.0
     private var framesAboveGate = 0
+    private let activity = OSAllocatedUnfairLock(initialState: SoundActivity())
 
     init(sensitivity: SpeechSegmenter.Sensitivity = .system, length: SegmentationLength = .standard) {
         segmenter = SpeechSegmenter(sensitivity: sensitivity, length: length)
@@ -369,6 +387,7 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     var events: AudioEvents { stream.stream }
+    var lastHeardAt: SuspendingClock.Instant? { activity.withLock { $0.lastHeardAt } }
 
     func copyFromTap(_ input: AVAudioPCMBuffer) {
         guard slots.wait(timeout: .now()) == .success else {
@@ -469,7 +488,9 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     private func summarizeSignal() {
         signalFrames += 1
         signalPeak = max(signalPeak, segmenter.lastRMS)
-        if segmenter.lastRMS > segmenter.lastThreshold { framesAboveGate += 1 }
+        let audible = segmenter.lastRMS > segmenter.lastThreshold
+        activity.withLock { $0.ingest(audible: audible) }
+        if audible { framesAboveGate += 1 }
         guard signalFrames == 500 else { return }
         AppLog.audioSignal(peak: signalPeak, threshold: segmenter.lastThreshold, voicedFrames: framesAboveGate)
         signalFrames = 0

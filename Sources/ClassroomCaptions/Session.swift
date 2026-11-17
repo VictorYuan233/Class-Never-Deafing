@@ -35,7 +35,7 @@ final class ClassroomSession: ObservableObject {
     @Published private(set) var phase = Phase.idle
     @Published private(set) var status = "准备就绪"
     @Published private(set) var captions: [Caption] = []
-    @Published private(set) var liveOriginal = ""
+    @Published private(set) var liveDrafts = TranscriptDrafts.Snapshot()
     @Published private(set) var notice: String?
     @Published private(set) var recordingClock = RecordingClock()
     @Published private(set) var automaticExportURL: URL?
@@ -70,6 +70,9 @@ final class ClassroomSession: ObservableObject {
     private var key: String?
     private var inputChanged = false
     private var resumeSignal: CheckedContinuation<Void, Never>?
+    private var silencePauseMinutes: Int?
+    private var silenceTask: Task<Void, Never>?
+    private var pausedForSilence = false
 
     var canExport: Bool {
         phase == .idle && captions.contains { $0.originalFinal && !$0.original.isEmpty }
@@ -125,7 +128,7 @@ final class ClassroomSession: ObservableObject {
         submitted.removeAll()
         originalRefresh?.cancel()
         originalRefresh = nil
-        liveOriginal = ""
+        liveDrafts = TranscriptDrafts.Snapshot()
         notice = nil
         recordingClock = RecordingClock()
         automaticExportURL = nil
@@ -152,9 +155,44 @@ final class ClassroomSession: ObservableObject {
         target = language
     }
 
-    func pause() {
+    func configureSilencePause(minutes: Int?) {
+        guard silencePauseMinutes != minutes else { return }
+        silencePauseMinutes = minutes
+        armSilencePause()
+    }
+
+    private func armSilencePause() {
+        cancelSilencePause()
+        guard phase == .listening, let capture, let silencePauseMinutes else { return }
+        let clock = SuspendingClock()
+        let startedAt = clock.now
+        let timeout = Duration.seconds(silencePauseMinutes * 60)
+        silenceTask = Task { [weak self, weak capture] in
+            while !Task.isCancelled {
+                guard let capture else { return }
+                let lastHeardAt = max(capture.lastHeardAt ?? startedAt, startedAt)
+                let deadline = lastHeardAt.advanced(by: timeout)
+                if clock.now >= deadline {
+                    guard let self, self.capture === capture else { return }
+                    self.pause(afterSilence: true)
+                    return
+                }
+                do { try await clock.sleep(until: deadline) }
+                catch { return }
+            }
+        }
+    }
+
+    private func cancelSilencePause() {
+        silenceTask?.cancel()
+        silenceTask = nil
+    }
+
+    func pause(afterSilence: Bool = false) {
         guard phase == .listening else { return }
-        AppLog.event("session.pause")
+        AppLog.event(afterSilence ? "session.pause.silence" : "session.pause")
+        pausedForSilence = afterSilence
+        cancelSilencePause()
         recordingClock.pause()
         phase = .pausing
         status = "正在暂停…"
@@ -187,6 +225,7 @@ final class ClassroomSession: ObservableObject {
             return
         }
         AppLog.event("session.stop.requested")
+        cancelSilencePause()
         let wasListening = phase == .listening || phase == .pausing
         recordingClock.pause()
         phase = .stopping
@@ -254,9 +293,11 @@ final class ClassroomSession: ObservableObject {
                 AppLog.event("session.listening")
                 listeningSince = Date()
                 status = "正在监听"
+                armSilencePause()
                 let delay: Duration = connection.configuredSource == source ? .seconds(55 * 60) : .zero
                 scheduleRotation(key: key, delay: delay)
                 try await upload(audio, tracking: input)
+                cancelSilencePause()
                 capture = nil
                 recordingClock.pause()
                 if phase == .stopping { break }
@@ -279,6 +320,7 @@ final class ClassroomSession: ObservableObject {
                 if let failure = active?.failure { throw failure }
                 throw AppFailure.microphone
             } catch {
+                cancelSilencePause()
                 capture?.stop()
                 capture = nil
                 recordingClock.pause()
@@ -338,7 +380,7 @@ final class ClassroomSession: ObservableObject {
         active = nil
         publishOriginal()
         phase = .paused
-        status = "已暂停"
+        status = pausedForSilence ? "无声超时，已自动暂停" : "已暂停"
     }
 
     private func upload(_ audio: AudioEvents, tracking input: AudioCapture) async throws {
@@ -502,6 +544,7 @@ final class ClassroomSession: ObservableObject {
 
     private func finishSession() {
         let stoppedByUser = phase == .stopping
+        cancelSilencePause()
         recordingClock.pause()
         closeAll()
         submitted.removeAll()
@@ -638,8 +681,8 @@ final class ClassroomSession: ObservableObject {
     }
 
     private func publishOriginal() {
-        let text = drafts.newest(activeConnection: active?.id, indices: indices)
-        if text != liveOriginal { liveOriginal = text }
+        let snapshot = drafts.snapshot()
+        if snapshot != liveDrafts { liveDrafts = snapshot }
     }
 
     private func scheduleOriginalRefresh() {

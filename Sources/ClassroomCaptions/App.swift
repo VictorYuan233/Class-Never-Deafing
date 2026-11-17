@@ -56,6 +56,15 @@ final class Preferences: ObservableObject {
         .flatMap(SegmentationLength.init(rawValue:)) ?? .standard {
         didSet { UserDefaults.standard.set(segmentationLength.rawValue, forKey: "segmentationLength") }
     }
+    @Published var silencePauseEnabled = UserDefaults.standard.bool(forKey: "silencePauseEnabled") {
+        didSet { UserDefaults.standard.set(silencePauseEnabled, forKey: "silencePauseEnabled") }
+    }
+    @Published var silencePauseMinutes = {
+        let minutes = UserDefaults.standard.object(forKey: "silencePauseMinutes") as? Int ?? SilenceAutoPause.defaultMinutes
+        return min(max(minutes, SilenceAutoPause.minutes.lowerBound), SilenceAutoPause.minutes.upperBound)
+    }() {
+        didSet { UserDefaults.standard.set(silencePauseMinutes, forKey: "silencePauseMinutes") }
+    }
     @Published var exportFolder = UserDefaults.standard.string(forKey: "exportFolderPath")
         .map { URL(filePath: $0, directoryHint: .isDirectory) } {
         didSet { UserDefaults.standard.set(exportFolder?.path, forKey: "exportFolderPath") }
@@ -208,6 +217,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }.store(in: &subscriptions)
         preferences.$targetID.sink { [weak self] id in
             self?.session.selectTarget(.target(id))
+        }.store(in: &subscriptions)
+        preferences.$silencePauseEnabled.combineLatest(preferences.$silencePauseMinutes).sink { [weak self] enabled, minutes in
+            self?.session.configureSilencePause(minutes: enabled ? minutes : nil)
         }.store(in: &subscriptions)
         preferences.$exportFolder.sink { [weak self] folder in
             self?.session.exportFolder = folder
