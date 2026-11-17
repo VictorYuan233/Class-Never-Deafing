@@ -26,7 +26,8 @@ struct CoreChecks {
         checkCaptionScroll()
         checkRecordingClock()
         try checkExport()
-        print("通过：语言、字幕窗快捷键、自定义模型参数、字体颜色、临时 Key、钥匙串后台超时、日志容量和淘汰、轻声检测、可调分句、Fast 翻译与补识别请求、系统音频格式转换与分包、多段实时原文、失败提示合并、字幕滚动、静音检测与暂停计时、自选目录自动保存。")
+        try await checkSessionRecording()
+        print("通过：语言、字幕窗快捷键、自定义模型参数、字体颜色、临时 Key、钥匙串后台超时、日志容量和淘汰、轻声检测、可调分句、Fast 翻译与补识别请求、系统音频格式转换与分包、多段实时原文、失败提示合并、字幕滚动、静音检测与暂停计时、字幕录音配对保存。")
     }
 
     private static func checkTranscriptDrafts() {
@@ -460,14 +461,56 @@ struct CoreChecks {
         let folder = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: folder) }
         let sameTime = Date(timeIntervalSince1970: 0)
-        let first = try TextExport.saveAutomatically(exported, in: folder, now: sameTime)
-        let second = try TextExport.saveAutomatically("另一节课\n", in: folder, createFolder: false, now: sameTime)
+        let first = try TextExport.saveAutomatically(exported, to: .init(folder: folder, createFolder: true, name: SessionExport.name(at: sameTime)))
+        let second = try TextExport.saveAutomatically("另一节课\n", to: .init(folder: folder, createFolder: false, name: SessionExport.name(at: sameTime)))
         let firstText = try String(contentsOf: first, encoding: .utf8)
         let secondText = try String(contentsOf: second, encoding: .utf8)
         precondition(first != second && first.pathExtension == "txt")
         precondition(firstText == exported && secondText == "另一节课\n")
         let unavailable = folder.appending(path: "disconnected-folder", directoryHint: .isDirectory)
-        let write = try? TextExport.saveAutomatically(exported, in: unavailable, createFolder: false)
+        let write = try? TextExport.saveAutomatically(exported, to: .init(folder: unavailable, createFolder: false, name: SessionExport.name()))
         precondition(write == nil && !FileManager.default.fileExists(atPath: unavailable.path))
+    }
+
+    private static func checkSessionRecording() async throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let staging = root.appendingPathComponent("staging")
+        let folder = root.appendingPathComponent("output")
+        let recording = SessionRecording(stagingFolder: staging)
+        let destination = SessionExport(folder: folder, createFolder: true, name: recording.name)
+        let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)!
+
+        func capture(_ sample: Int16, using recording: SessionRecording) async throws -> Int {
+            let processor = AudioProcessor(recording: recording)
+            let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 9_600)!
+            pcm.frameLength = 9_600
+            let samples = pcm.int16ChannelData![0]
+            for index in 0..<Int(pcm.frameLength) { samples[index] = index % 20 < 10 ? sample : -sample }
+            processor.copyFromTap(pcm)
+            processor.finish()
+            var packets = 0
+            for try await _ in processor.events { packets += 1 }
+            return packets
+        }
+
+        // Two captures model pause and resume. The recording includes audio before the speech gate.
+        let silentPackets = try await capture(0, using: recording)
+        let speechPackets = try await capture(1200, using: recording)
+        precondition(silentPackets == 0 && speechPackets > 0)
+        let outcome = await recording.finish(to: destination)
+        guard let url = outcome.url, outcome.warning == nil else { preconditionFailure("Recording did not save") }
+        let text = try TextExport.saveAutomatically("Hello.\n你好。\n", to: destination)
+        precondition(url.pathExtension == "wav" && url.deletingPathExtension() == text.deletingPathExtension())
+        let recorded = try AVAudioFile(forReading: url)
+        precondition(abs(Double(recorded.length) / recorded.fileFormat.sampleRate - 0.8) < 0.1)
+
+        let recovery = SessionRecording(stagingFolder: staging)
+        _ = try await capture(1200, using: recovery)
+        let fallback = await recovery.finish(to: .init(folder: root.appendingPathComponent("missing"),
+                                                       createFolder: false, name: recovery.name))
+        precondition(fallback.url?.deletingLastPathComponent().path == staging.path && fallback.warning != nil)
+        let retained = try AVAudioFile(forReading: fallback.url!)
+        precondition(retained.length > 0)
     }
 }

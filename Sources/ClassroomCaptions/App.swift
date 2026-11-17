@@ -190,6 +190,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var guideWindow: NSWindow?
     private var subscriptions = Set<AnyCancellable>()
     private var audioDevicesListener: AudioObjectPropertyListenerBlock?
+    private var waitingToQuit = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.launch(version: AppMetadata.version, build: AppMetadata.build)
@@ -254,6 +255,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard session.phase != .idle else { return .terminateNow }
+        if !waitingToQuit {
+            waitingToQuit = true
+            session.stop()
+            Task {
+                while session.phase != .idle { try? await Task.sleep(for: .milliseconds(100)) }
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         AppLog.event("app.quit")
         shortcuts.shutdown()
@@ -273,8 +287,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(item("停止转写", #selector(stop), enabled: session.phase != .idle && session.phase != .stopping))
         menu.addItem(item("隐藏字幕窗", #selector(hidePanel), enabled: panel?.isVisible == true))
         menu.addItem(item("显示字幕窗", #selector(showPanel)))
-        if session.automaticExportURL != nil {
-            menu.addItem(item("在 Finder 中显示已保存字幕", #selector(revealExport)))
+        if !session.savedFiles.isEmpty {
+            menu.addItem(item("在 Finder 中显示已保存文件", #selector(revealExport)))
         }
         menu.addItem(item("另存本节课文本…", #selector(save), enabled: session.canExport))
         menu.addItem(.separator())
@@ -383,7 +397,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let panel else { return false }
         let alert = NSAlert()
         alert.messageText = "使用音频输入和 OpenAI"
-        alert.informativeText = "开始后，App 会使用你设置的 API Key，把所选输入的音频及待翻译的课堂内容发送给 OpenAI。点击停止后，双语字幕会自动保存到你设置的文件夹。"
+        alert.informativeText = "开始后，App 会采集所选输入并同步录音，通过你的 API Key 把转写用音频和待译文本发送给 OpenAI。点击停止后，录音和双语字幕会自动保存到你设置的文件夹。"
         alert.addButton(withTitle: "同意并开始")
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
@@ -567,7 +581,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func chooseExportFolder() {
         guard let settings else { return }
         let picker = NSOpenPanel()
-        picker.title = "选择字幕保存文件夹"
+        picker.title = "选择字幕和录音保存文件夹"
         picker.prompt = "选择"
         picker.canChooseFiles = false
         picker.canChooseDirectories = true
@@ -580,9 +594,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     @objc private func revealExport() {
-        if let url = session.automaticExportURL {
-            NSWorkspace.shared.activateFileViewerSelecting([url])
-        }
+        NSWorkspace.shared.activateFileViewerSelecting(session.savedFiles)
     }
 
     @objc private func save() {

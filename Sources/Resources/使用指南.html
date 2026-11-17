@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="app-version" content="0.6.5">
+<meta name="app-version" content="0.7.0">
 <title>Class Never Deafing 使用指南</title>
 <style>
   :root {
@@ -59,8 +59,8 @@
 <main>
   <header>
     <h1>Class Never Deafing 使用指南</h1>
-    <p class="version">适用于 0.6.5 · Apple Silicon Mac · macOS 14 或更高版本</p>
-    <p>用一个悬浮窗同时看实时原文和译文，结束后自动保存双语文本。</p>
+    <p class="version">适用于 0.7.0 · Apple Silicon Mac · macOS 14 或更高版本</p>
+    <p>用一个悬浮窗同时看实时原文和译文，结束后自动保存录音和双语文本。</p>
   </header>
 
   <nav aria-label="章节">
@@ -70,7 +70,7 @@
     <a href="#appearance">字幕外观</a>
     <a href="#segments">调整分句</a>
     <a href="#models">选择模型</a>
-    <a href="#save">保存字幕</a>
+    <a href="#save">保存字幕和录音</a>
     <a href="#troubleshooting">排查问题</a>
     <a href="#diagnostics">诊断日志</a>
   </nav>
@@ -127,8 +127,9 @@
   </section>
 
   <section id="save">
-    <h2>保存字幕</h2>
-    <p>点击停止后，App 停止采音，等剩余转写和译文处理完成，再自动写入一个 UTF-8 <code>.txt</code>。点字幕窗文件夹图标可在 Finder 中定位。也可从菜单栏选择「另存本节课文本」。</p>
+    <h2>保存字幕和录音</h2>
+    <p>开始转写时会自动录下所选输入源。手动暂停或无声自动暂停期间停止录音，继续时接着录同一个文件。隐藏字幕窗后，录音和转写继续。</p>
+    <p>点击停止后会自动保存 <code>.wav</code> 录音。等剩余转写和译文处理完成后，同目录下会保存同名的 UTF-8 <code>.txt</code> 字幕。只要采到了音频，即使没有可导出的字幕，也会保存录音。录制中选择退出时，App 会先收尾保存。点字幕窗文件夹图标可在 Finder 中定位已保存的文件。菜单栏仍可另存双语文本。</p>
     <p>在「设置 → 保存」选择默认目录。首次默认使用 <code>~/Library/Application Support/课堂字幕/课堂记录/</code>。导出保留原文和译文，未完成的译文会有标记。</p>
   </section>
 
@@ -141,7 +142,7 @@
       <li><strong>原文有字但译文失败</strong>时，检查翻译模型 ID、项目权限和 OpenAI API 额度。改用项目可用的模型后，开始新一节录制。</li>
       <li>从菜单栏右键菜单的倒数第二项打开「设置」，滚动到设置底部可找到「使用指南」和「详情」。退出 App 请选右键菜单的最后一项「退出」。「详情」显示版本、构建号、系统要求和本版更新内容。</li>
     </ul>
-    <p>所选输入的音频和待译文本会发往 OpenAI。空转写补识别会再向 OpenAI 提交对应的音频片段，可能产生额外转写费用。仅在内存中短暂保留近期音频，原始音频不会写入磁盘。</p>
+    <p>用于转写的音频和待译文本会发往 OpenAI。空转写补识别会再次提交对应片段，可能产生额外转写费用。完整录音会单独保存在本机。若所选目录无法写入，可从字幕窗的文件夹按钮找到保留在「未归档录音」中的文件。</p>
   </section>
   <section id="diagnostics">
     <h2>诊断日志</h2>

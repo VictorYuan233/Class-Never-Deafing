@@ -39,6 +39,7 @@ final class ClassroomSession: ObservableObject {
     @Published private(set) var notice: String?
     @Published private(set) var recordingClock = RecordingClock()
     @Published private(set) var automaticExportURL: URL?
+    @Published private(set) var automaticRecordingURL: URL?
     @Published private(set) var hasError = false
     var exportFolder: URL?
 
@@ -78,6 +79,8 @@ final class ClassroomSession: ObservableObject {
         phase == .idle && captions.contains { $0.originalFinal && !$0.original.isEmpty }
     }
 
+    var savedFiles: [URL] { [automaticExportURL, automaticRecordingURL].compactMap { $0 } }
+
     func start(
         source: Language, target: Language, transcription: TranscriptionModel, translation: TranslationConfiguration,
         audioInputID: String, segmentationLength: SegmentationLength,
@@ -104,7 +107,7 @@ final class ClassroomSession: ObservableObject {
                 }
                 prepare(transcription: transcription, translation: translation, audioInputID: audioInputID,
                         segmentationLength: segmentationLength, key: key)
-                await run()
+                await run(recording: SessionRecording())
             } catch {
                 guard !Task.isCancelled else { return }
                 AppLog.failure("session.authorization.failed", error)
@@ -132,6 +135,7 @@ final class ClassroomSession: ObservableObject {
         notice = nil
         recordingClock = RecordingClock()
         automaticExportURL = nil
+        automaticRecordingURL = nil
         self.audioInputID = audioInputID
         self.segmentationLength = segmentationLength
         transcriptionModel = transcription
@@ -263,8 +267,17 @@ final class ClassroomSession: ObservableObject {
         }
     }
 
-    private func run() async {
-        defer { finishSession() }
+    private func run(recording: SessionRecording) async {
+        await listen(recording: recording)
+        let destination = SessionExport(folder: exportFolder ?? TextExport.automaticFolder,
+                                        createFolder: exportFolder == nil, name: recording.name)
+        let audio = await recording.finish(to: destination)
+        automaticRecordingURL = audio.url
+        await drainResults()
+        finishSession(destination: destination, recordingWarning: audio.warning)
+    }
+
+    private func listen(recording: SessionRecording) async {
         guard let key, phase != .stopping else { return }
         var attempts = 0
 
@@ -283,7 +296,7 @@ final class ClassroomSession: ObservableObject {
                 try await connection.connect(source: source, model: transcriptionModel)
                 AppLog.event("session.connection.ready")
                 guard phase != .stopping else { break }
-                let input = AudioCapture(inputID: audioInputID, length: segmentationLength)
+                let input = AudioCapture(inputID: audioInputID, length: segmentationLength, recording: recording)
                 capture = input
                 status = "正在启动音频输入…"
                 let audio = try await input.start()
@@ -298,6 +311,7 @@ final class ClassroomSession: ObservableObject {
                 scheduleRotation(key: key, delay: delay)
                 try await upload(audio, tracking: input)
                 cancelSilencePause()
+                await input.stopAndDrain()
                 capture = nil
                 recordingClock.pause()
                 if phase == .stopping { break }
@@ -321,7 +335,7 @@ final class ClassroomSession: ObservableObject {
                 throw AppFailure.microphone
             } catch {
                 cancelSilencePause()
-                capture?.stop()
+                await capture?.stopAndDrain()
                 capture = nil
                 recordingClock.pause()
                 cancelRotation()
@@ -357,6 +371,11 @@ final class ClassroomSession: ObservableObject {
             }
         }
 
+        await capture?.stopAndDrain()
+        capture = nil
+    }
+
+    private func drainResults() async {
         while connections.values.contains(where: \.outstanding) {
             if Task.isCancelled { break }
             try? await Task.sleep(for: .milliseconds(100))
@@ -542,38 +561,42 @@ final class ClassroomSession: ObservableObject {
         active = nil
     }
 
-    private func finishSession() {
+    private func finishSession(destination: SessionExport, recordingWarning: String?) {
         let stoppedByUser = phase == .stopping
         cancelSilencePause()
         recordingClock.pause()
         closeAll()
         submitted.removeAll()
-        capture?.stop()
-        capture = nil
         stopDeadline?.cancel()
         stopDeadline = nil
         key = nil
         sessionTask = nil
-        phase = .idle
         AppLog.event("session.ended", number: Int(recordingClock.elapsed().components.seconds))
-        guard stoppedByUser else { return }
-        let text = TextExport.render(captions)
-        guard !text.isEmpty else {
-            status = "已停止 · 没有可保存的字幕"
-            return
+        var warnings = [recordingWarning].compactMap { $0 }
+        if stoppedByUser {
+            let text = TextExport.render(captions)
+            if !text.isEmpty {
+                do {
+                    automaticExportURL = try TextExport.saveAutomatically(text, to: destination)
+                    AppLog.event("export.success")
+                } catch {
+                    AppLog.failure("export.failed", error)
+                    warnings.append("字幕自动保存失败。可在菜单栏选择「另存本节课文本」。")
+                }
+            }
+            switch (automaticExportURL, automaticRecordingURL) {
+            case (.some, .some): status = "已停止 · 字幕和录音已保存"
+            case (.some, nil): status = "已停止 · 字幕已保存"
+            case (nil, .some): status = "已停止 · 录音已保存"
+            case (nil, nil): status = "已停止 · 没有可保存的内容"
+            }
         }
-        do {
-            automaticExportURL = try TextExport.saveAutomatically(
-                text, in: exportFolder ?? TextExport.automaticFolder, createFolder: exportFolder == nil
-            )
-            status = "已停止 · 字幕已保存"
-            AppLog.event("export.success")
-        } catch {
-            AppLog.failure("export.failed", error)
+        if !warnings.isEmpty {
             hasError = true
-            status = "已停止 · 自动保存失败"
-            notice = "请检查保存目录，或从菜单栏选择「另存本节课文本」。"
+            if stoppedByUser { status = "已停止 · 保存有提示" }
+            notice = ([stoppedByUser ? nil : notice].compactMap { $0 } + warnings).joined(separator: "\n")
         }
+        phase = .idle
     }
 
     private func apply(_ event: RealtimeEvent) {

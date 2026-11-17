@@ -259,9 +259,10 @@ final class AudioCapture {
     private var stopped = false
     var lastHeardAt: SuspendingClock.Instant? { processor.lastHeardAt }
 
-    init(inputID: String, length: SegmentationLength) {
+    init(inputID: String, length: SegmentationLength, recording: SessionRecording) {
         self.inputID = inputID
-        processor = AudioProcessor(sensitivity: inputID == AudioInput.systemID ? .system : .microphone, length: length)
+        processor = AudioProcessor(sensitivity: inputID == AudioInput.systemID ? .system : .microphone,
+                                   length: length, recording: recording)
     }
 
     func start() async throws -> AudioEvents {
@@ -291,6 +292,13 @@ final class AudioCapture {
         }
         if !screenStarting { stopSystemAudio() }
         processor.finish()
+    }
+
+    func stopAndDrain() async {
+        stop()
+        await withCheckedContinuation { continuation in
+            processor.queue.async { continuation.resume() }
+        }
     }
 
     private func startMicrophone() throws {
@@ -371,6 +379,7 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     // Keep roughly the former queue duration with 80 ms packets.
     private let stream = AudioEvents.makeStream(bufferingPolicy: .bufferingOldest(210))
     private let output = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)!
+    private let recording: SessionRecording?
     private var converter: AVAudioConverter?
     private var segmenter: SpeechSegmenter
     private var packetBatcher = AudioPacketBatcher()
@@ -381,8 +390,10 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     private var framesAboveGate = 0
     private let activity = OSAllocatedUnfairLock(initialState: SoundActivity())
 
-    init(sensitivity: SpeechSegmenter.Sensitivity = .system, length: SegmentationLength = .standard) {
+    init(sensitivity: SpeechSegmenter.Sensitivity = .system, length: SegmentationLength = .standard,
+         recording: SessionRecording? = nil) {
         segmenter = SpeechSegmenter(sensitivity: sensitivity, length: length)
+        self.recording = recording
         super.init()
     }
 
@@ -475,6 +486,7 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         guard let samples = buffer.int16ChannelData?.pointee, buffer.frameLength > 0 else { return }
+        recording?.append(buffer)
         remainder.append(Data(bytes: samples, count: Int(buffer.frameLength) * 2))
         while remainder.count >= SpeechSegmenter.bytesPerFrame {
             let frame = Data(remainder.prefix(SpeechSegmenter.bytesPerFrame))

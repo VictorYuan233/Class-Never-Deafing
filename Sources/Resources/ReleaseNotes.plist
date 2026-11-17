@@ -3,12 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>0.6.5</string>
+    <string>0.7.0</string>
     <key>highlights</key>
     <array>
-        <string>实时原文可完整换行，并与尚待翻译的段落一起滚动查看。</string>
-        <string>连续的「此段未能转写」合并成一行。</string>
-        <string>设置新增无声自动暂停，可设定等待时间，手动继续同一场转写。</string>
+        <string>转写时自动录下所选输入源。暂停会停止录音，继续时接着录同一场。</string>
+        <string>停止后自动保存 WAV 录音和同名双语字幕，可从字幕窗打开 Finder 定位文件。</string>
     </array>
 </dict>
 </plist>

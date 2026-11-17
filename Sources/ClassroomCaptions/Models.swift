@@ -300,6 +300,31 @@ struct RecordingClock {
     }
 }
 
+struct SessionExport {
+    let folder: URL
+    let createFolder: Bool
+    let name: String
+
+    static func name(at date: Date = .now) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        return "课堂字幕-\(formatter.string(from: date))-\(UUID().uuidString.prefix(8))"
+    }
+
+    func url(endingIn fileExtension: String) throws -> URL {
+        if createFolder {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        } else {
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+        }
+        return folder.appendingPathComponent(name).appendingPathExtension(fileExtension)
+    }
+}
+
 enum TextExport {
     static var automaticFolder: URL {
         URL.applicationSupportDirectory.appending(path: "课堂字幕/课堂记录", directoryHint: .isDirectory)
@@ -316,20 +341,8 @@ enum TextExport {
         return blocks.isEmpty ? "" : blocks.joined(separator: "\n\n") + "\n"
     }
 
-    static func saveAutomatically(_ content: String, in folder: URL, createFolder: Bool = true, now: Date = Date()) throws -> URL {
-        if createFolder {
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        } else {
-            var isDirectory: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
-                throw CocoaError(.fileNoSuchFile)
-            }
-        }
-        let date = DateFormatter()
-        date.locale = Locale(identifier: "en_US_POSIX")
-        date.dateFormat = "yyyy-MM-dd-HHmmss"
-        let suffix = UUID().uuidString.prefix(8)
-        let url = folder.appendingPathComponent("课堂字幕-\(date.string(from: now))-\(suffix).txt")
+    static func saveAutomatically(_ content: String, to destination: SessionExport) throws -> URL {
+        let url = try destination.url(endingIn: "txt")
         try content.write(to: url, atomically: true, encoding: .utf8)
         return url
     }

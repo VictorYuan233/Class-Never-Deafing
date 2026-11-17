@@ -7,13 +7,13 @@
     <key>CFBundleName</key><string>Class Never Deafing</string>
     <key>CFBundleDisplayName</key><string>Class Never Deafing</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleVersion</key><string>23</string>
-    <key>CFBundleShortVersionString</key><string>0.6.5</string>
+    <key>CFBundleVersion</key><string>24</string>
+    <key>CFBundleShortVersionString</key><string>0.7.0</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Class Never Deafing 从所选麦克风采集音频，并将音频发送给 OpenAI 生成实时字幕。</string>
+    <string>Class Never Deafing 从所选麦克风录音，并将用于转写的音频发送给 OpenAI 生成实时字幕。</string>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>Class Never Deafing 从 Mac 播放的系统声音生成实时字幕。</string>
+    <string>Class Never Deafing 从 Mac 播放的系统声音生成实时字幕并保存录音。</string>
 </dict>
 </plist>

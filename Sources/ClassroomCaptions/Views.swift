@@ -87,11 +87,11 @@ struct CaptionView: View {
                         width: buttonWidth, enabled: paused || session.phase == .listening, action: togglePause)
                 control("停止", "stop.fill", width: buttonWidth,
                         enabled: session.phase != .idle && session.phase != .stopping, action: stop)
-                if session.automaticExportURL != nil {
+                if !session.savedFiles.isEmpty {
                     Button(action: revealExport) {
                         Image(systemName: "folder").frame(width: buttonWidth, height: 24)
                     }
-                    .accessibilityLabel("在 Finder 中显示已保存字幕")
+                    .accessibilityLabel("在 Finder 中显示已保存文件")
                     .help("显示已保存的文件")
                 }
                 Button {
@@ -427,6 +427,9 @@ struct SettingsView: View {
                     }
                     Button("选择文件夹…", action: chooseExportFolder)
                 }
+                Text("停止后在此目录保存录音和双语字幕。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("字幕窗") {
                 Toggle("始终置顶", isOn: $preferences.floating)
