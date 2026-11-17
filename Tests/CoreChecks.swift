@@ -6,28 +6,79 @@ import CoreMedia
 struct CoreChecks {
     @MainActor static func main() async throws {
         checkLanguageConfiguration()
+        try checkCaptionShortcuts()
         try checkTranslationConfiguration()
         try checkSubtitleColors()
-        checkTemporaryCredential()
+        await checkTemporaryCredential()
+        try await checkKeychainTimeout()
+        try checkLogRetention()
         checkSpeechBoundaries()
         checkTranslationSegments()
         try await checkSystemAudioConversion()
         checkCaptionScroll()
         checkRecordingClock()
         try checkExport()
-        print("通过：语言、自定义模型参数、字体颜色、临时 Key、短停顿分段与双句翻译、系统音频格式转换、字幕滚动、暂停计时、自选目录自动保存。")
+        print("通过：语言、字幕窗快捷键、自定义模型参数、字体颜色、临时 Key、钥匙串后台超时、日志容量和淘汰、短停顿分段与双句翻译、系统音频格式转换、字幕滚动、暂停计时、自选目录自动保存。")
     }
 
-    @MainActor private static func checkTemporaryCredential() {
+    @MainActor private static func checkTemporaryCredential() async {
         precondition(KeyStore.temporaryKey == nil)
         KeyStore.useUntilQuit("offline-test-placeholder")
-        let activeKey = try? KeyStore.read()
+        let activeKey = try? await KeyStore.read()
         precondition(activeKey == "offline-test-placeholder")
         KeyStore.useUntilQuit("replacement-placeholder")
-        let replacement = try? KeyStore.read()
+        let replacement = try? await KeyStore.read()
         precondition(replacement == "replacement-placeholder")
         KeyStore.clearTemporaryKey()
         precondition(KeyStore.temporaryKey == nil)
+    }
+
+    @MainActor private static func checkKeychainTimeout() async throws {
+        let worker = KeychainWorker()
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+        do {
+            _ = try await worker.perform(timeout: .milliseconds(50)) {
+                precondition(!Thread.isMainThread)
+                release.wait()
+                return "late result"
+            }
+            preconditionFailure("A stalled read should time out")
+        } catch AppFailure.keychainTimeout {}
+        do {
+            _ = try await worker.perform { "overlapping read" }
+            preconditionFailure("A timed-out underlying operation must not allow overlapping requests")
+        } catch AppFailure.keychainBusy {}
+
+        release.signal()
+        for _ in 0..<50 {
+            do {
+                let value = try await worker.perform { "available again" }
+                precondition(value == "available again")
+                return
+            } catch AppFailure.keychainBusy {
+                try await Task.sleep(for: .milliseconds(10))
+            }
+        }
+        preconditionFailure("The worker did not recover after the system call returned")
+    }
+
+    private static func checkLogRetention() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("test.log")
+        let log = BoundedLogFile(url: url, maximumBytes: 256)
+        for index in 0..<100 {
+            try log.append(Data("事件-\(index)\n".utf8))
+            let data = try Data(contentsOf: url)
+            precondition(data.count <= log.maximumBytes)
+        }
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let lines = text.split(separator: "\n")
+        precondition(lines.first != "事件-0" && lines.last == "事件-99")
+        precondition(lines.allSatisfy { $0.hasPrefix("事件-") })
+        let positions = lines.compactMap { Int($0.dropFirst(3)) }
+        precondition(positions.count == lines.count && positions == Array((positions.first ?? 100)...99))
     }
 
     @MainActor private static func checkLanguageConfiguration() {
@@ -51,6 +102,18 @@ struct CoreChecks {
         precondition(committed["model"] as? String == "gpt-transcribe")
         precondition(committed["delay"] == nil)
         precondition(committed["languages"] as? [String] == ["en"])
+    }
+
+    private static func checkCaptionShortcuts() throws {
+        let show = CaptionKeyCombination(keyCode: 15, flags: [.command, .option], characters: "r")!
+        let localized = CaptionKeyCombination(keyCode: 15, flags: [.command, .option], characters: "p")!
+        let hide = CaptionKeyCombination(keyCode: 15, flags: [.command, .control], characters: "r")!
+        precondition(show.display == "⌥⌘R" && show.matches(localized) && !show.matches(hide))
+        precondition(CaptionKeyCombination(keyCode: 123, flags: [.control], characters: nil)?.display == "⌃←")
+        precondition(CaptionKeyCombination(keyCode: 122, flags: [], characters: "\u{F704}")?.display == "F1")
+        precondition(CaptionKeyCombination(keyCode: 15, flags: [.shift], characters: "R") == nil)
+        let restored = try PropertyListDecoder().decode(CaptionKeyCombination.self, from: PropertyListEncoder().encode(show))
+        precondition(restored == show)
     }
 
     private static func checkTranslationConfiguration() throws {

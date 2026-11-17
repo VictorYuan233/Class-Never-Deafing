@@ -7,8 +7,8 @@
     <key>CFBundleName</key><string>Class Never Deafing</string>
     <key>CFBundleDisplayName</key><string>Class Never Deafing</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleVersion</key><string>12</string>
-    <key>CFBundleShortVersionString</key><string>0.5.4</string>
+    <key>CFBundleVersion</key><string>15</string>
+    <key>CFBundleShortVersionString</key><string>0.5.7</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key>

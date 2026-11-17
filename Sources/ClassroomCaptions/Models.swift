@@ -255,6 +255,7 @@ enum AppFailure: LocalizedError {
     case translationModelName
     case api(String, retryable: Bool)
     case keychain(OSStatus)
+    case keychainTimeout, keychainBusy
 
     var errorDescription: String? {
         switch self {
@@ -277,6 +278,29 @@ enum AppFailure: LocalizedError {
             "钥匙串授权已取消（−128）。可以重试，或选择仅本次使用。"
         case .keychain(let status):
             "无法访问 macOS 钥匙串（\(status)）。"
+        case .keychainTimeout:
+            "钥匙串等待超时。请检查 macOS 授权提示，或在设置中选择「仅本次使用」。"
+        case .keychainBusy:
+            "钥匙串仍有一项操作在等待 macOS 响应。可处理授权提示，或在设置中选择「仅本次使用」。"
+        }
+    }
+
+    var diagnosticCode: String {
+        switch self {
+        case .microphone: "microphone_start_failed"
+        case .microphoneDenied: "microphone_denied"
+        case .inputUnavailable: "input_unavailable"
+        case .systemAudio: "system_audio_start_failed"
+        case .systemAudioDenied: "system_audio_denied"
+        case .systemAudioInterrupted: "system_audio_interrupted"
+        case .audioFormat: "audio_format"
+        case .audioOverload: "audio_overload"
+        case .timeout: "connection_timeout"
+        case .translationModelName: "invalid_model_id"
+        case .api(_, let retryable): "openai_error retryable=\(retryable)"
+        case .keychain(let status): "keychain code=\(status)"
+        case .keychainTimeout: "keychain_timeout"
+        case .keychainBusy: "keychain_busy"
         }
     }
 
@@ -310,64 +334,3 @@ enum AppFailure: LocalizedError {
     }
 }
 
-@MainActor
-enum KeyStore {
-    private static let identity: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: "com.classneverdeafing.captions.openai",
-        kSecAttrAccount as String: "user-api-key",
-    ]
-    private(set) static var temporaryKey: String?
-
-    static func read() throws -> String? {
-        if let temporaryKey { return temporaryKey }
-        var query = identity
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecItemNotFound { return nil }
-        try check(status)
-        return (item as? Data).flatMap { String(data: $0, encoding: .utf8) }
-    }
-
-    static func hasSavedKey() throws -> Bool {
-        var query = identity
-        query[kSecReturnAttributes as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecItemNotFound { return false }
-        try check(status)
-        return true
-    }
-
-    static func save(_ key: String) throws {
-        let value = [kSecValueData as String: Data(key.utf8)]
-        let record = identity.merging(value) { _, new in new }
-        let status = SecItemAdd(record as CFDictionary, nil)
-        if status == errSecDuplicateItem {
-            try check(SecItemUpdate(identity as CFDictionary, value as CFDictionary))
-        } else {
-            try check(status)
-        }
-        clearTemporaryKey()
-    }
-
-    static func useUntilQuit(_ key: String) {
-        temporaryKey = key
-    }
-
-    static func clearTemporaryKey() {
-        temporaryKey = nil
-    }
-
-    static func delete() throws {
-        let status = SecItemDelete(identity as CFDictionary)
-        if status != errSecItemNotFound { try check(status) }
-    }
-
-    private static func check(_ status: OSStatus) throws {
-        guard status == errSecSuccess else { throw AppFailure.keychain(status) }
-    }
-}

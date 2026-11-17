@@ -3,10 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>0.5.4</string>
+    <string>0.5.7</string>
     <key>highlights</key>
     <array>
-        <string>精简右键菜单，移除顶部状态行，底部依次放置「设置」和「退出」。</string>
+        <string>钥匙串读取移到后台，开始转写时可取消等待或在超时后改用临时 Key。</string>
+        <string>新增诊断日志。容量上限为 1 MiB，超出时自动淘汰最早的记录。</string>
     </array>
 </dict>
 </plist>

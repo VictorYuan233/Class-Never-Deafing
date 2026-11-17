@@ -51,6 +51,7 @@ final class RealtimeConnection {
             } catch {
                 guard let self, !self.closed else { return }
                 if let status = (socket.response as? HTTPURLResponse)?.statusCode, status >= 400 {
+                    AppLog.event("openai.realtime.http_error", number: status)
                     self.disconnect(AppFailure.fromAPI(status: status))
                 } else {
                     self.disconnect(error)
@@ -141,6 +142,7 @@ final class RealtimeConnection {
         case "session.updated":
             ready = true
         case "error":
+            AppLog.event("openai.realtime.server_error")
             let error = object["error"] as? [String: Any] ?? [:]
             if let id = error["event_id"] as? String,
                let index = pending.firstIndex(where: { $0.eventID == id }) {
@@ -203,6 +205,7 @@ enum TranslationAPI {
         request.httpBody = try requestBody(original, to: target, model: model, previous: previous)
         let (bytes, response) = try await URLSession.shared.bytes(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            AppLog.event("openai.translation.http_error", number: http.statusCode)
             var body = Data()
             for try await byte in bytes {
                 body.append(byte)

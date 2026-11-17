@@ -6,7 +6,7 @@ import Foundation
 @MainActor
 final class ClassroomSession: ObservableObject {
     enum Phase: Equatable {
-        case idle, starting, listening, pausing, paused, reconnecting, stopping
+        case idle, authorizing, starting, listening, pausing, paused, reconnecting, stopping
     }
 
     @Published private(set) var phase = Phase.idle
@@ -45,8 +45,46 @@ final class ClassroomSession: ObservableObject {
         phase == .idle && captions.contains { $0.originalFinal && !$0.original.isEmpty }
     }
 
-    func start(source: Language, target: Language, transcription: TranscriptionModel, translation: TranslationConfiguration, audioInputID: String, key: String) {
+    func start(
+        source: Language, target: Language, transcription: TranscriptionModel, translation: TranslationConfiguration,
+        audioInputID: String, authorize: @escaping @MainActor () async throws -> String?
+    ) {
         guard phase == .idle else { return }
+        AppLog.event("session.start.requested")
+        phase = .authorizing
+        status = "正在读取钥匙串…"
+        notice = nil
+        hasError = false
+        self.source = source
+        self.target = target
+        sessionTask = Task {
+            do {
+                let key = try await authorize()
+                try Task.checkCancellation()
+                guard let key else {
+                    status = "准备就绪"
+                    phase = .idle
+                    sessionTask = nil
+                    return
+                }
+                prepare(transcription: transcription, translation: translation, audioInputID: audioInputID, key: key)
+                await run()
+            } catch {
+                guard !Task.isCancelled else { return }
+                AppLog.failure("session.authorization.failed", error)
+                status = description(for: error)
+                notice = status
+                hasError = true
+                phase = .idle
+                sessionTask = nil
+            }
+        }
+    }
+
+    private func prepare(
+        transcription: TranscriptionModel,
+        translation: TranslationConfiguration, audioInputID: String, key: String
+    ) {
         cancelTranslations()
         captions.removeAll()
         indices.removeAll()
@@ -55,16 +93,12 @@ final class ClassroomSession: ObservableObject {
         notice = nil
         recordingClock = RecordingClock()
         automaticExportURL = nil
-        self.source = source
-        self.target = target
         self.audioInputID = audioInputID
         transcriptionModel = transcription
         translationModel = translation
         self.key = key
         phase = .starting
-        hasError = false
         status = "正在准备音频输入…"
-        sessionTask = Task { await run() }
     }
 
     func selectSource(_ language: Language) {
@@ -83,6 +117,7 @@ final class ClassroomSession: ObservableObject {
 
     func pause() {
         guard phase == .listening else { return }
+        AppLog.event("session.pause")
         recordingClock.pause()
         phase = .pausing
         status = "正在暂停…"
@@ -92,6 +127,7 @@ final class ClassroomSession: ObservableObject {
 
     func resume() {
         guard phase == .paused else { return }
+        AppLog.event("session.resume")
         phase = .starting
         status = "正在继续…"
         endPauseWait()
@@ -105,6 +141,15 @@ final class ClassroomSession: ObservableObject {
 
     func stop() {
         guard phase != .idle, phase != .stopping else { return }
+        if phase == .authorizing {
+            AppLog.event("session.start.cancelled")
+            sessionTask?.cancel()
+            sessionTask = nil
+            status = "已取消启动"
+            phase = .idle
+            return
+        }
+        AppLog.event("session.stop.requested")
         let wasListening = phase == .listening || phase == .pausing
         recordingClock.pause()
         phase = .stopping
@@ -116,6 +161,7 @@ final class ClassroomSession: ObservableObject {
         stopDeadline = Task {
             try? await Task.sleep(for: .seconds(12))
             guard !Task.isCancelled, phase == .stopping else { return }
+            AppLog.event("session.stop.drain_timeout")
             closeAll()
             cancelTranslations()
             for index in captions.indices where captions[index].originalFinal && !captions[index].translationFinal {
@@ -128,16 +174,21 @@ final class ClassroomSession: ObservableObject {
     func retryTranslation(_ id: UUID) {
         guard workers[id] == nil, !translationQueue.contains(id), let index = indices[id],
               captions[index].translationFailed else { return }
-        do {
-            let credential = try key ?? KeyStore.read()
-            guard let credential else {
-                notice = "请先在设置中保存 OpenAI API Key。"
-                return
+        Task {
+            do {
+                let credential: String?
+                if let key { credential = key } else { credential = try await KeyStore.read() }
+                guard workers[id] == nil, !translationQueue.contains(id), let index = indices[id],
+                      captions[index].translationFailed else { return }
+                guard let credential else {
+                    notice = "请先在设置中保存 OpenAI API Key。"
+                    return
+                }
+                translationQueue.append(id)
+                startQueuedTranslations(using: credential)
+            } catch {
+                if indices[id] != nil { notice = error.localizedDescription }
             }
-            translationQueue.append(id)
-            startQueuedTranslations(using: credential)
-        } catch {
-            notice = error.localizedDescription
         }
     }
 
@@ -157,7 +208,9 @@ final class ClassroomSession: ObservableObject {
             var listeningSince: Date?
             do {
                 status = attempts == 0 ? "正在连接 OpenAI…" : "正在重连（\(attempts)/3）…"
+                AppLog.event("session.connection.begin", number: attempts)
                 try await connection.connect(source: source, model: transcriptionModel)
+                AppLog.event("session.connection.ready")
                 guard phase != .stopping else { break }
                 let input = AudioCapture(inputID: audioInputID)
                 capture = input
@@ -166,6 +219,7 @@ final class ClassroomSession: ObservableObject {
                 guard phase != .stopping else { break }
                 recordingClock.resume()
                 phase = .listening
+                AppLog.event("session.listening")
                 listeningSince = Date()
                 status = "正在监听"
                 let delay: Duration = connection.configuredSource == source ? .seconds(55 * 60) : .zero
@@ -205,6 +259,7 @@ final class ClassroomSession: ObservableObject {
                     continue
                 }
                 let error = active?.failure ?? error
+                AppLog.failure("session.failed", error)
                 if let listeningSince, Date().timeIntervalSince(listeningSince) >= 30 {
                     attempts = 0
                 }
@@ -400,6 +455,7 @@ final class ClassroomSession: ObservableObject {
         key = nil
         sessionTask = nil
         phase = .idle
+        AppLog.event("session.ended", number: Int(recordingClock.elapsed().components.seconds))
         guard stoppedByUser else { return }
         let text = TextExport.render(captions)
         guard !text.isEmpty else {
@@ -411,7 +467,9 @@ final class ClassroomSession: ObservableObject {
                 text, in: exportFolder ?? TextExport.automaticFolder, createFolder: exportFolder == nil
             )
             status = "已停止 · 字幕已保存"
+            AppLog.event("export.success")
         } catch {
+            AppLog.failure("export.failed", error)
             hasError = true
             status = "已停止 · 自动保存失败"
             notice = "请检查保存目录，或从菜单栏选择「另存本节课文本」。"
@@ -490,6 +548,7 @@ final class ClassroomSession: ObservableObject {
                     }
                 } catch {
                     if !Task.isCancelled, let index = indices[id] {
+                        AppLog.failure("translation.failed", error)
                         captions[index].translation = ""
                         captions[index].translationFailed = true
                         notice = description(for: error)

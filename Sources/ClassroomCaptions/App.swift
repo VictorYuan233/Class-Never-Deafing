@@ -129,15 +129,41 @@ final class Preferences: ObservableObject {
     }
 }
 
+@MainActor
+final class CaptionTitlebarLayout: ObservableObject {
+    // macOS can temporarily replace the close button with a wider sharing control.
+    private static let minimumLeading: CGFloat = 80
+    @Published private(set) var centerFromTop: CGFloat = 16
+    @Published private(set) var leading: CGFloat = minimumLeading
+
+    func align(to closeButton: NSButton, in content: NSView) {
+        let frame = content.convert(closeButton.bounds, from: closeButton)
+        let bounds = content.bounds
+        let center = content.isFlipped ? frame.midY - bounds.minY : bounds.maxY - frame.midY
+        guard frame.width > 0, (0..<bounds.height).contains(center) else { return }
+        let inset = max(Self.minimumLeading, frame.maxX - bounds.minX + 12)
+        if abs(centerFromTop - center) > 0.5 { centerFromTop = center }
+        if abs(leading - inset) > 0.5 { leading = inset }
+    }
+}
+
 final class CaptionPanel: NSPanel {
+    let toolbarLayout = CaptionTitlebarLayout()
+
     override var canBecomeKey: Bool { true }
+
+    func alignToolbar() {
+        guard let close = standardWindowButton(.closeButton), let contentView else { return }
+        toolbarLayout.align(to: close, in: contentView)
+    }
 }
 
 @MainActor
-final class AppController: NSObject, NSApplicationDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let session = ClassroomSession()
     let preferences = Preferences()
     private let keySettings = KeySettings()
+    private let shortcuts = CaptionShortcuts()
     private var statusItem: NSStatusItem?
     private let statusMenu = NSMenu()
     private var panel: CaptionPanel?
@@ -147,6 +173,7 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var audioDevicesListener: AudioObjectPropertyListenerBlock?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppLog.launch(version: AppMetadata.version, build: AppMetadata.build)
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
             button.image = NSImage(systemSymbolName: "captions.bubble", accessibilityDescription: AppMetadata.name)
@@ -176,8 +203,15 @@ final class AppController: NSObject, NSApplicationDelegate {
             self?.session.exportFolder = folder
         }.store(in: &subscriptions)
         observeAudioDevices()
+        shortcuts.start { [weak self] action in
+            switch action {
+            case .show: self?.showPanel()
+            case .hide: self?.hidePanel()
+            }
+        }
         NotificationCenter.default.addObserver(self, selector: #selector(fitPanelOnScreen), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         showPanel()
+        AppLog.event("app.ready")
     }
 
     @objc private func showStatusMenu(_ button: NSStatusBarButton) {
@@ -199,6 +233,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        AppLog.event("app.quit")
+        shortcuts.shutdown()
         if let audioDevicesListener {
             var property = AudioInput.hardwareDevicesProperty
             AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &property, .main, audioDevicesListener)
@@ -213,7 +249,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         let paused = session.phase == .paused
         menu.addItem(item(paused ? "继续转写" : "暂停转写", #selector(togglePause), enabled: paused || session.phase == .listening))
         menu.addItem(item("停止转写", #selector(stop), enabled: session.phase != .idle && session.phase != .stopping))
-        menu.addItem(item(panel?.isVisible == true ? "隐藏字幕窗" : "显示字幕窗", #selector(togglePanel)))
+        menu.addItem(item("隐藏字幕窗", #selector(hidePanel), enabled: panel?.isVisible == true))
+        menu.addItem(item("显示字幕窗", #selector(showPanel)))
         if session.automaticExportURL != nil {
             menu.addItem(item("在 Finder 中显示已保存字幕", #selector(revealExport)))
         }
@@ -226,7 +263,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(selectionMenu("目标语言", values: Language.targets.map { ($0.id, $0.label) },
                                    chosen: preferences.targetID, action: #selector(pickTarget(_:))))
         menu.addItem(.separator())
-        menu.addItem(item("设置", #selector(openSettings), key: ","))
+        let settingsItem = item("设置", #selector(openSettings))
+        if #available(macOS 27.0, *) {
+            settingsItem.preferredImageVisibility = .hidden
+        } else if #available(macOS 26.0, *) {
+            // An explicit empty image prevents AppKit from inferring a Settings icon.
+            settingsItem.image = NSImage(size: NSSize(width: 1, height: 1), flipped: false) { _ in true }
+        }
+        menu.addItem(settingsItem)
         menu.addItem(item("退出", #selector(quit), key: "q"))
     }
 
@@ -273,30 +317,65 @@ final class AppController: NSObject, NSApplicationDelegate {
             showError(error)
             return
         }
+        showPanel()
+        session.start(
+            source: .source(preferences.sourceID), target: .target(preferences.targetID),
+            transcription: preferences.transcriptionModel, translation: translation,
+            audioInputID: preferences.audioInputID
+        ) { [weak self] in
+            try await self?.authorizeStart()
+        }
+    }
+
+    private func authorizeStart() async throws -> String? {
+        let credential: String?
+        if KeyStore.temporaryKey != nil { AppLog.event("keychain.read.temporary") }
         do {
-            guard let key = try KeyStore.read() else {
-                openSettings()
-                return
-            }
-            if !UserDefaults.standard.bool(forKey: "cloudDisclosureAccepted") {
-                let alert = NSAlert()
-                alert.messageText = "使用音频输入和 OpenAI"
-                alert.informativeText = "开始后，App 会使用你设置的 API Key，把所选输入的音频及待翻译的课堂内容发送给 OpenAI。点击停止后，双语字幕会自动保存到你设置的文件夹。"
-                alert.addButton(withTitle: "同意并开始")
-                alert.addButton(withTitle: "取消")
-                NSApp.activate(ignoringOtherApps: true)
-                guard alert.runModal() == .alertFirstButtonReturn else { return }
-                UserDefaults.standard.set(true, forKey: "cloudDisclosureAccepted")
-            }
-            showPanel()
-            session.start(
-                source: .source(preferences.sourceID), target: .target(preferences.targetID),
-                transcription: preferences.transcriptionModel, translation: translation,
-                audioInputID: preferences.audioInputID, key: key
-            )
+            credential = try await KeyStore.read()
         } catch {
+            if !Task.isCancelled {
+                openSettings()
+                keySettings.report(error)
+            }
+            throw error
+        }
+        try Task.checkCancellation()
+        guard let credential else {
             openSettings()
-            keySettings.report(error)
+            return nil
+        }
+        if !UserDefaults.standard.bool(forKey: "cloudDisclosureAccepted") {
+            AppLog.event("app.consent.prompt")
+            let accepted = await requestCloudConsent()
+            try Task.checkCancellation()
+            AppLog.event(accepted ? "app.consent.accepted" : "app.consent.declined")
+            guard accepted else { return nil }
+            UserDefaults.standard.set(true, forKey: "cloudDisclosureAccepted")
+        }
+        return credential
+    }
+
+    private func requestCloudConsent() async -> Bool {
+        guard let panel else { return false }
+        let alert = NSAlert()
+        alert.messageText = "使用音频输入和 OpenAI"
+        alert.informativeText = "开始后，App 会使用你设置的 API Key，把所选输入的音频及待翻译的课堂内容发送给 OpenAI。点击停止后，双语字幕会自动保存到你设置的文件夹。"
+        alert.addButton(withTitle: "同意并开始")
+        alert.addButton(withTitle: "取消")
+        NSApp.activate(ignoringOtherApps: true)
+        return await withTaskCancellationHandler {
+            if Task.isCancelled { return false }
+            return await withCheckedContinuation { continuation in
+                alert.beginSheetModal(for: panel) { response in
+                    continuation.resume(returning: response == .alertFirstButtonReturn)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor in
+                if alert.window.sheetParent === panel {
+                    panel.endSheet(alert.window, returnCode: .cancel)
+                }
+            }
         }
     }
 
@@ -308,18 +387,15 @@ final class AppController: NSObject, NSApplicationDelegate {
         if session.phase == .paused { session.resume() } else { session.pause() }
     }
 
-    @objc private func togglePanel() {
-        if panel?.isVisible == true {
-            panel?.orderOut(nil)
-        } else {
-            showPanel()
-        }
+    @objc private func hidePanel() {
+        panel?.orderOut(nil)
     }
 
-    private func showPanel() {
+    @objc private func showPanel() {
         if let panel {
             fitPanelOnScreen()
             panel.orderFrontRegardless()
+            panel.alignToolbar()
             return
         }
         let panel = CaptionPanel(
@@ -337,12 +413,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel.isMovableByWindowBackground = true
         panel.isReleasedWhenClosed = false
         panel.minSize = NSSize(width: 360, height: 160)
+        panel.delegate = self
         panel.level = preferences.floating ? .floating : .normal
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.contentView = NSHostingView(rootView: CaptionView(
             session: session,
             preferences: preferences,
+            titlebar: panel.toolbarLayout,
             begin: { [weak self] in self?.begin() },
             togglePause: { [weak self] in self?.togglePause() },
             stop: { [weak self] in self?.stop() },
@@ -353,6 +431,17 @@ final class AppController: NSObject, NSApplicationDelegate {
         self.panel = panel
         fitPanelOnScreen()
         panel.orderFrontRegardless()
+        panel.alignToolbar()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        (notification.object as? CaptionPanel)?.alignToolbar()
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        if let settings, notification.object as? NSWindow === settings {
+            shortcuts.cancelRecording()
+        }
     }
 
     @objc private func fitPanelOnScreen() {
@@ -378,11 +467,14 @@ final class AppController: NSObject, NSApplicationDelegate {
                 backing: .buffered, defer: false
             )
             window.title = "\(AppMetadata.name) 设置"
+            window.delegate = self
             window.isReleasedWhenClosed = false
             window.contentView = NSHostingView(rootView: SettingsView(
                 preferences: preferences,
                 keys: keySettings,
+                shortcuts: shortcuts,
                 chooseExportFolder: { [weak self] in self?.chooseExportFolder() },
+                revealDiagnostics: { [weak self] in self?.revealDiagnostics() },
                 openGuide: { [weak self] in self?.showGuide() },
                 openAbout: { [weak self] in self?.showAbout() }
             ))
@@ -391,6 +483,17 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         settings?.makeKeyAndOrderFront(nil)
+    }
+
+    private func revealDiagnostics() {
+        Task {
+            do {
+                let url = try await AppLog.currentFile()
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            } catch {
+                showError(error)
+            }
+        }
     }
 
     @objc private func showGuide() {

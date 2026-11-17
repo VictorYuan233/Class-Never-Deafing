@@ -153,13 +153,18 @@ final class AudioCapture {
 
     func start() async throws -> AudioEvents {
         if inputID == AudioInput.systemID {
+            AppLog.event("audio.system.permission_check")
             try await startSystemAudio()
         } else {
+            AppLog.event(inputID == AudioInput.defaultID ? "audio.microphone.default" : "audio.microphone.selected")
+            AppLog.event("audio.microphone.permission_check")
             guard await AVCaptureDevice.requestAccess(for: .audio) else { throw AppFailure.microphoneDenied }
             guard !stopped else { throw CancellationError() }
+            AppLog.event("audio.microphone.authorized")
             try startMicrophone()
         }
         guard !stopped else { throw CancellationError() }
+        AppLog.event("audio.started")
         return processor.events
     }
 

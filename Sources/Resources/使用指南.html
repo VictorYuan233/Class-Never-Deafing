@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="app-version" content="0.5.4">
+<meta name="app-version" content="0.5.7">
 <title>Class Never Deafing 使用指南</title>
 <style>
   :root {
@@ -59,17 +59,19 @@
 <main>
   <header>
     <h1>Class Never Deafing 使用指南</h1>
-    <p class="version">适用于 0.5.4 · Apple Silicon Mac · macOS 14 或更高版本</p>
+    <p class="version">适用于 0.5.7 · Apple Silicon Mac · macOS 14 或更高版本</p>
     <p>用一个悬浮窗同时看实时原文和译文，结束后自动保存双语文本。</p>
   </header>
 
   <nav aria-label="章节">
     <a href="#start">首次使用</a>
     <a href="#record">录制和切换语言</a>
+    <a href="#window">显示与隐藏字幕窗</a>
     <a href="#appearance">字幕外观</a>
     <a href="#models">选择模型</a>
     <a href="#save">保存字幕</a>
     <a href="#troubleshooting">排查问题</a>
+    <a href="#diagnostics">诊断日志</a>
   </nav>
 
   <section id="start">
@@ -85,10 +87,16 @@
   <section id="record">
     <h2>录制和切换语言</h2>
     <ul>
-      <li>顶部一行包含状态圆点、两个语言菜单、按秒计时、开始、暂停／继续、停止和置顶。绿色表示正在采音，橙色表示暂停，蓝色表示连接或收尾，红色表示出错。鼠标停留时可查看状态和按钮含义。</li>
+      <li>顶部一行包含左上角的关闭按钮、状态圆点、两个语言菜单、按秒计时、开始、暂停／继续、停止和置顶。绿色表示正在采音，橙色表示暂停，蓝色表示连接或收尾，红色表示出错。鼠标停留时可查看状态和按钮含义。</li>
       <li>源语言默认「自动检测」，目标语言默认「普通话（简体中文）」。录制中可直接点顶部菜单切换。源语言从下一段生效，目标语言用于下一次提交翻译的段落。</li>
-      <li>字幕原文在上，译文在下。正常每一到两句翻译一次，连续讲话最多约 12 秒提交一次。暂停会冻结计时，继续时沿用当前课堂的字幕。</li>
+      <li>字幕原文在上，译文在下。正常每一到两句翻译一次，连续讲话最多约 12 秒提交一次。暂停会冻结计时，继续时沿用当前课堂的字幕。关闭按钮可隐藏字幕窗。隐藏后转录和计时继续运行，仍可从菜单栏停止转写。</li>
     </ul>
+  </section>
+
+  <section id="window">
+    <h2>显示与隐藏字幕窗</h2>
+    <p>右键点击菜单栏的气泡图标。「显示字幕窗」在「隐藏字幕窗」下方，即使窗口已经打开，也会将它带到最前。显示一次后，是否持续置顶仍由字幕窗上的图钉控制。</p>
+    <p>在「设置 → 快捷键」分别给「显示字幕窗」和「隐藏字幕窗」点击「录制快捷键」，再按下想用的组合。可用带 ⌘、⌥ 或 ⌃ 的组合，或单独使用功能键。按 Esc 可取消，也可点「清除」删除已设置的快捷键。快捷键在其他 App 中也能使用。</p>
   </section>
 
   <section id="appearance">
@@ -116,12 +124,17 @@
   <section id="troubleshooting">
     <h2>排查问题</h2>
     <ul>
-      <li><strong>钥匙串报错</strong>时，可以解锁「登录」钥匙串后重试，或用「仅本次使用」。</li>
+      <li><strong>钥匙串报错</strong>时，可以处理系统授权提示或解锁「登录」钥匙串后重试。读取等待约 10 秒会超时，也可以用停止按钮取消，再从设置选择「仅本次使用」。</li>
       <li><strong>有声音但无字幕</strong>时，先确认是否选了正确的音频输入，再检查系统权限、网络和 API Key。</li>
       <li><strong>原文有字但译文失败</strong>时，检查翻译模型 ID、项目权限和 OpenAI API 额度。改用项目可用的模型后，开始新一节录制。</li>
       <li>从菜单栏右键菜单的倒数第二项打开「设置」，滚动到设置底部可找到「使用指南」和「详情」。退出 App 请选右键菜单的最后一项「退出」。「详情」显示版本、构建号、系统要求和本版更新内容。</li>
     </ul>
     <p>转写和翻译通过 OpenAI API 处理。所选输入的音频和待译文本会发往 OpenAI。App 在停止后保存双语文本，原始音频不会写入磁盘。</p>
+  </section>
+  <section id="diagnostics">
+    <h2>诊断日志</h2>
+    <p>在「设置 → 诊断日志」点「在 Finder 中显示日志」。文件位于 <code>~/Library/Logs/Class Never Deafing/diagnostics.log</code>，记录 App 启动、钥匙串等待、音频权限、连接和保存结果。排查时可根据点击开始的时间查看附近记录。</p>
+    <p>日志上限为 1 MiB。超过时，App 会删除最早的完整记录并保留最近的记录。日志不包含 API Key、音频、原文或译文。</p>
   </section>
 </main>
 </body>

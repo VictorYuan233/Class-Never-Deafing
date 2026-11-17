@@ -4,6 +4,7 @@ import SwiftUI
 struct CaptionView: View {
     @ObservedObject var session: ClassroomSession
     @ObservedObject var preferences: Preferences
+    @ObservedObject var titlebar: CaptionTitlebarLayout
     @StateObject private var scrollState = CaptionScrollState()
     let begin: () -> Void
     let togglePause: () -> Void
@@ -19,7 +20,7 @@ struct CaptionView: View {
         case .idle: session.hasError ? .red : foreground.opacity(0.40)
         case .listening: .green
         case .pausing, .paused: .orange
-        case .starting, .reconnecting, .stopping: .blue
+        case .authorizing, .starting, .reconnecting, .stopping: .blue
         }
     }
 
@@ -29,11 +30,13 @@ struct CaptionView: View {
                 toolbar(compact: false)
                 toolbar(compact: true)
             }
-            .padding(.leading, 48)
+            .padding(.leading, titlebar.leading)
             .padding(.trailing, 10)
-            .frame(height: 32)
+            .frame(height: 24)
+            .padding(.top, max(0, titlebar.centerFromTop - 12))
+            .padding(.bottom, 4)
             Rectangle().fill(foreground.opacity(0.15)).frame(height: 1)
-            if let notice = session.notice {
+            if let notice = session.notice ?? (session.phase == .authorizing ? "正在准备开始，可点击停止取消。" : nil) {
                 Label(notice, systemImage: "exclamationmark.circle")
                     .font(.system(size: 11))
                     .padding(.horizontal, 18)
@@ -50,6 +53,7 @@ struct CaptionView: View {
         .shadow(color: foreground == .white ? .black.opacity(0.76) : .clear, radius: 1.6, y: 1)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: preferences.background).opacity(preferences.opacity))
+        .ignoresSafeArea(.container, edges: .top)
     }
 
     private func toolbar(compact: Bool) -> some View {
@@ -270,28 +274,34 @@ final class KeySettings: ObservableObject {
     @Published private(set) var hasSavedKey = false
     @Published private(set) var usesTemporaryKey = false
     @Published private(set) var keyStatus = ""
+    @Published private(set) var isWorking = false
 
     var isConfigured: Bool { usesTemporaryKey || hasSavedKey }
     var hasEntry: Bool { !entry.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-    func refreshSavedStatus() {
+    func refreshSavedStatus() async {
         do {
-            hasSavedKey = try KeyStore.hasSavedKey()
+            hasSavedKey = try await KeyStore.hasSavedKey()
         } catch {
-            if !usesTemporaryKey { report(error) }
+            if !Task.isCancelled, !usesTemporaryKey, keyStatus.isEmpty { report(error) }
         }
     }
 
     func saveKey() {
-        guard let key = validatedEntry() else { return }
-        do {
-            try KeyStore.save(key)
-            hasSavedKey = true
-            usesTemporaryKey = false
-            entry = ""
-            keyStatus = ""
-        } catch {
-            report(error)
+        guard !isWorking, let key = validatedEntry() else { return }
+        isWorking = true
+        keyStatus = "正在等待钥匙串保存…"
+        Task {
+            defer { isWorking = false }
+            do {
+                try await KeyStore.save(key)
+                hasSavedKey = true
+                usesTemporaryKey = KeyStore.temporaryKey != nil
+                if entry.trimmingCharacters(in: .whitespacesAndNewlines) == key { entry = "" }
+                keyStatus = ""
+            } catch {
+                report(error)
+            }
         }
     }
 
@@ -309,16 +319,21 @@ final class KeySettings: ObservableObject {
             usesTemporaryKey = false
             entry = ""
             keyStatus = ""
-            refreshSavedStatus()
+            Task { await refreshSavedStatus() }
             return
         }
-        do {
-            try KeyStore.delete()
-            hasSavedKey = false
-            entry = ""
-            keyStatus = ""
-        } catch {
-            report(error)
+        guard !isWorking else { return }
+        isWorking = true
+        keyStatus = "正在等待钥匙串删除…"
+        Task {
+            defer { isWorking = false }
+            do {
+                try await KeyStore.delete()
+                hasSavedKey = false
+                keyStatus = ""
+            } catch {
+                report(error)
+            }
         }
     }
 
@@ -340,7 +355,9 @@ final class KeySettings: ObservableObject {
 struct SettingsView: View {
     @ObservedObject var preferences: Preferences
     @ObservedObject var keys: KeySettings
+    @ObservedObject var shortcuts: CaptionShortcuts
     let chooseExportFolder: () -> Void
+    let revealDiagnostics: () -> Void
     let openGuide: () -> Void
     let openAbout: () -> Void
 
@@ -416,6 +433,32 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("快捷键") {
+                ForEach(CaptionShortcutAction.allCases) { action in
+                    LabeledContent(action.title) {
+                        HStack {
+                            let isRecording = shortcuts.recording == action
+                            let shortcut = shortcuts.combinations[action]
+                            Button(isRecording ? "请按快捷键…" : shortcut?.display ?? "录制快捷键") {
+                                shortcuts.beginRecording(action)
+                            }
+                            .accessibilityLabel("\(action.title)快捷键")
+                            .accessibilityValue(isRecording ? "等待输入" : shortcut?.display ?? "未设置")
+                            if shortcut != nil {
+                                Button("清除") { shortcuts.clear(action) }
+                                    .accessibilityLabel("清除\(action.title)快捷键")
+                            }
+                        }
+                    }
+                }
+                if let message = shortcuts.message {
+                    Text(message).font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text(shortcuts.recording == nil ? "设置后可在其他 App 中使用。" : "按 Esc 可取消录制。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             Section("OpenAI API") {
                 SecureField("API Key", text: $keys.entry, prompt: Text(keys.isConfigured ? "输入新 Key 以替换" : "粘贴你的 API Key"))
                     .onSubmit(keys.saveKey)
@@ -436,14 +479,21 @@ struct SettingsView: View {
                 HStack {
                     if keys.isConfigured {
                         Button(keys.usesTemporaryKey ? "清除临时 Key" : "删除已保存 Key", role: .destructive, action: keys.deleteKey)
+                            .disabled(keys.isWorking && !keys.usesTemporaryKey)
                     }
                     Spacer()
                     Button("仅本次使用", action: keys.useTemporaryKey)
                         .disabled(!keys.hasEntry)
                         .help("仅在 App 内存中保存，退出 App 后清除。")
                     Button("存入钥匙串", action: keys.saveKey)
-                        .disabled(!keys.hasEntry)
+                        .disabled(!keys.hasEntry || keys.isWorking)
                 }
+            }
+            Section("诊断日志") {
+                Button("在 Finder 中显示日志", action: revealDiagnostics)
+                Text("日志最多 1 MiB，超出后删除最早的记录。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section {
                 HStack {
@@ -453,7 +503,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { keys.refreshSavedStatus() }
+        .task { await keys.refreshSavedStatus() }
     }
 
     @ViewBuilder
