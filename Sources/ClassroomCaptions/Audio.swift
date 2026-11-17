@@ -7,7 +7,15 @@ import ScreenCaptureKit
 
 enum AudioEvent {
     case audio(Data)
-    case commit
+    case commit(SpeechBoundary)
+}
+
+struct SpeechBoundary {
+    let voicedFrames: Int
+    let silentFrames: Int
+
+    // Eight 20 ms frames are enough evidence to flag a possibly missed short word.
+    var hasSustainedSignal: Bool { voicedFrames >= 8 }
 }
 
 struct QueuedAudioEvent {
@@ -33,7 +41,7 @@ struct AudioPacketBatcher {
             return buffered.count >= Self.packetBytes ? flush() : []
         case .commit:
             isFirstPacket = true
-            return flush() + [QueuedAudioEvent(event: .commit, queuedAt: now)]
+            return flush() + [QueuedAudioEvent(event: event, queuedAt: now)]
         }
     }
 
@@ -47,20 +55,39 @@ struct AudioPacketBatcher {
 }
 
 struct SpeechSegmenter {
+    enum Sensitivity {
+        case microphone, system
+
+        var initialNoiseFloor: Double { self == .microphone ? 35 : 100 }
+
+        func threshold(noiseFloor: Double, isSpeaking: Bool) -> Double {
+            switch self {
+            case .system: max(180, noiseFloor * 2.8)
+            case .microphone:
+                isSpeaking ? max(45, noiseFloor * 1.55) : max(65, noiseFloor * 1.9)
+            }
+        }
+    }
+
     static let samplesPerFrame = 480
     static let bytesPerFrame = samplesPerFrame * 2
-    // At 20 ms per frame, look for a shorter pause as a turn gets longer.
-    static let sentencePauseFrames = 42
-    static let longTurnPauseFrames = 22
-    static let longTurnFrames = 400
-    static let maximumTurnFrames = 600
-
     private var preRoll: [Data] = []
-    private var noiseFloor = 100.0
+    private let sensitivity: Sensitivity
+    private let limits: SegmentationLength.Limits
+    private var noiseFloor: Double
     private var voicedFrames = 0
+    private var turnVoicedFrames = 0
     private var activeFrames = 0
     private var silentFrames = 0
     private var continuing = false
+    private(set) var lastRMS = 0.0
+    private(set) var lastThreshold = 0.0
+
+    init(sensitivity: Sensitivity = .system, length: SegmentationLength = .standard) {
+        self.sensitivity = sensitivity
+        limits = length.limits
+        noiseFloor = sensitivity.initialNoiseFloor
+    }
 
     mutating func ingest(_ frame: Data) -> [AudioEvent] {
         let level = frame.withUnsafeBytes { bytes in
@@ -71,7 +98,10 @@ struct SpeechSegmenter {
             }
             return sqrt(squared / Double(samples.count))
         }
-        let voiced = level > max(180, noiseFloor * 2.8)
+        let threshold = sensitivity.threshold(noiseFloor: noiseFloor, isSpeaking: activeFrames > 0)
+        lastRMS = level
+        lastThreshold = threshold
+        let voiced = level > threshold
         if activeFrames == 0 {
             preRoll.append(frame)
             if preRoll.count > 11 { preRoll.removeFirst() }
@@ -83,6 +113,7 @@ struct SpeechSegmenter {
             }
             guard voicedFrames >= (continuing ? 1 : 2) else { return [] }
             activeFrames = preRoll.count
+            turnVoicedFrames = voicedFrames
             silentFrames = 0
             var audio = Data()
             for buffered in preRoll { audio.append(buffered) }
@@ -91,13 +122,15 @@ struct SpeechSegmenter {
         }
 
         activeFrames += 1
+        if voiced { turnVoicedFrames += 1 }
         silentFrames = voiced ? 0 : silentFrames + 1
-        let pauseFrames = activeFrames >= Self.longTurnFrames ? Self.longTurnPauseFrames : Self.sentencePauseFrames
+        let pauseFrames = activeFrames >= limits.longTurnFrames ? limits.longTurnPauseFrames : limits.pauseFrames
         let endedAtPause = silentFrames >= pauseFrames
-        if endedAtPause || activeFrames >= Self.maximumTurnFrames {
+        if endedAtPause || activeFrames >= limits.maximumFrames {
             continuing = !endedAtPause
+            let boundary = speechBoundary
             resetActive()
-            return [.audio(frame), .commit]
+            return [.audio(frame), .commit(boundary)]
         }
         return [.audio(frame)]
     }
@@ -112,15 +145,41 @@ struct SpeechSegmenter {
         // Realtime requires at least 100 ms for a manual commit.
         if activeFrames < 5 {
             let padding = Data(count: (5 - activeFrames) * Self.bytesPerFrame)
-            return [.audio(padding), .commit]
+            return [.audio(padding), .commit(speechBoundary)]
         }
-        return [.commit]
+        return [.commit(speechBoundary)]
+    }
+
+    private var speechBoundary: SpeechBoundary {
+        SpeechBoundary(voicedFrames: turnVoicedFrames, silentFrames: silentFrames)
     }
 
     private mutating func resetActive() {
         activeFrames = 0
         silentFrames = 0
         voicedFrames = 0
+        turnVoicedFrames = 0
+    }
+}
+
+enum RecoveryAudio {
+    static func amplifyQuietPCM(_ pcm: Data) -> Data {
+        guard pcm.count.isMultiple(of: 2) else { return pcm }
+        let peak = pcm.withUnsafeBytes { bytes in
+            bytes.bindMemory(to: Int16.self).reduce(0) { max($0, abs(Int($1))) }
+        }
+        guard peak > 0 else { return pcm }
+        // Raise quiet recordings by at most 12 dB with headroom for peaks.
+        let gain = min(4.0, 16_000.0 / Double(peak))
+        guard gain > 1 else { return pcm }
+        var amplified = pcm
+        amplified.withUnsafeMutableBytes { bytes in
+            let samples = bytes.bindMemory(to: Int16.self)
+            for index in samples.indices {
+                samples[index] = Int16((Double(samples[index]) * gain).rounded())
+            }
+        }
+        return amplified
     }
 }
 
@@ -177,14 +236,15 @@ typealias AudioEvents = AsyncThrowingStream<QueuedAudioEvent, Error>
 @MainActor
 final class AudioCapture {
     private let inputID: String
-    private let processor = AudioProcessor()
+    private let processor: AudioProcessor
     private(set) var engine: AVAudioEngine?
     private var screenStream: SCStream?
     private var screenStarting = false
     private var stopped = false
 
-    init(inputID: String) {
+    init(inputID: String, length: SegmentationLength) {
         self.inputID = inputID
+        processor = AudioProcessor(sensitivity: inputID == AudioInput.systemID ? .system : .microphone, length: length)
     }
 
     func start() async throws -> AudioEvents {
@@ -295,15 +355,24 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     private let stream = AudioEvents.makeStream(bufferingPolicy: .bufferingOldest(210))
     private let output = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)!
     private var converter: AVAudioConverter?
-    private var segmenter = SpeechSegmenter()
+    private var segmenter: SpeechSegmenter
     private var packetBatcher = AudioPacketBatcher()
     private var remainder = Data()
     private var finished = false
+    private var signalFrames = 0
+    private var signalPeak = 0.0
+    private var framesAboveGate = 0
+
+    init(sensitivity: SpeechSegmenter.Sensitivity = .system, length: SegmentationLength = .standard) {
+        segmenter = SpeechSegmenter(sensitivity: sensitivity, length: length)
+        super.init()
+    }
 
     var events: AudioEvents { stream.stream }
 
     func copyFromTap(_ input: AVAudioPCMBuffer) {
         guard slots.wait(timeout: .now()) == .success else {
+            AppLog.event("audio.capture.overload")
             stream.continuation.finish(throwing: AppFailure.audioOverload)
             return
         }
@@ -391,8 +460,21 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
         while remainder.count >= SpeechSegmenter.bytesPerFrame {
             let frame = Data(remainder.prefix(SpeechSegmenter.bytesPerFrame))
             remainder.removeFirst(SpeechSegmenter.bytesPerFrame)
-            emit(segmenter.ingest(frame))
+            let events = segmenter.ingest(frame)
+            summarizeSignal()
+            emit(events)
         }
+    }
+
+    private func summarizeSignal() {
+        signalFrames += 1
+        signalPeak = max(signalPeak, segmenter.lastRMS)
+        if segmenter.lastRMS > segmenter.lastThreshold { framesAboveGate += 1 }
+        guard signalFrames == 500 else { return }
+        AppLog.audioSignal(peak: signalPeak, threshold: segmenter.lastThreshold, voicedFrames: framesAboveGate)
+        signalFrames = 0
+        signalPeak = 0
+        framesAboveGate = 0
     }
 
     private func emit(_ events: [AudioEvent]) {
@@ -401,6 +483,7 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
         for event in events {
             for packet in packetBatcher.append(event, now: now) {
                 if case .dropped = stream.continuation.yield(packet) {
+                    AppLog.event("audio.upload.overload")
                     stream.continuation.finish(throwing: AppFailure.audioOverload)
                     return
                 }

@@ -3,11 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>0.5.8</string>
+    <string>0.6.4</string>
     <key>highlights</key>
     <array>
-        <string>合并短音频包，并平滑原文和译文的流式刷新，减少片段积压和界面重绘。</string>
-        <string>诊断日志新增音频发送等待、转写定稿和翻译首字耗时。</string>
+        <string>设置新增「记录诊断日志」开关。关闭后停止记录，已保存的日志仍可查看。</string>
     </array>
 </dict>
 </plist>

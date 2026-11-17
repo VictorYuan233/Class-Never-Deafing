@@ -42,10 +42,13 @@ struct CaptionView: View {
                     .padding(.horizontal, 18)
                     .padding(.top, 7)
             }
-            if session.captions.isEmpty && session.preview.isEmpty {
+            if session.captions.isEmpty && session.liveOriginal.isEmpty {
                 Spacer(minLength: 0)
             } else {
                 transcript
+            }
+            if !session.liveOriginal.isEmpty {
+                liveOriginal
             }
         }
         .buttonStyle(.plain)
@@ -155,6 +158,22 @@ struct CaptionView: View {
         return ceil(font.ascender - font.descender + font.leading)
     }
 
+    private var liveOriginal: some View {
+        Text(session.liveOriginal)
+            .font(originalFont)
+            .foregroundStyle(originalColor)
+            .lineLimit(3)
+            .truncationMode(.head)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 18)
+            .padding(.top, 5)
+            .padding(.bottom, blankLineHeight)
+            .layoutPriority(1)
+            .accessibilityIdentifier("liveOriginal")
+    }
+
     private var transcript: some View {
         GeometryReader { viewport in
             ScrollViewReader { scroll in
@@ -165,14 +184,6 @@ struct CaptionView: View {
                                 if !caption.original.isEmpty || caption.originalFailed {
                                     captionRow(caption)
                                 }
-                            }
-                            if !session.preview.isEmpty {
-                                Text(session.preview)
-                                    .font(originalFont)
-                                    .foregroundStyle(originalColor)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
                             }
                         }
                         .padding(.horizontal, 18)
@@ -212,7 +223,7 @@ struct CaptionView: View {
 
     private func captionRow(_ caption: Caption) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(caption.original.isEmpty ? "此段转写中断" : caption.original)
+            Text(caption.original.isEmpty ? "此段未能转写" : caption.original)
                 .font(originalFont)
                 .foregroundStyle(originalColor)
                 .fixedSize(horizontal: false, vertical: true)
@@ -227,7 +238,7 @@ struct CaptionView: View {
                 Button("翻译未完成 · 重试") { session.retryTranslation(caption.id) }
                     .font(.system(size: 12, weight: .medium))
                     .overlay(alignment: .bottom) { Rectangle().frame(height: 1).opacity(0.45) }
-            } else if caption.originalFinal {
+            } else if caption.originalFinal && !caption.original.isEmpty {
                 Text("正在翻译…")
                     .font(.system(size: 12))
                     .foregroundStyle(foreground.opacity(0.65))
@@ -382,6 +393,26 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            Section("分句") {
+                Slider(value: Binding(
+                    get: { Double(preferences.segmentationLength.rawValue) },
+                    set: { value in
+                        if let length = SegmentationLength(rawValue: Int(value.rounded())) {
+                            preferences.segmentationLength = length
+                        }
+                    }
+                ), in: Double(SegmentationLength.short.rawValue)...Double(SegmentationLength.extended.rawValue), step: 1) {
+                    Text("分句长短")
+                } minimumValueLabel: {
+                    Text("短")
+                } maximumValueLabel: {
+                    Text("长")
+                }
+                .accessibilityValue(preferences.segmentationLength.title)
+                Text("\(preferences.segmentationLength.detail)。下次开始转写时生效。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
             Section("保存") {
                 LabeledContent("默认保存目录") {
                     Text(((preferences.exportFolder ?? TextExport.automaticFolder).path as NSString).abbreviatingWithTildeInPath)
@@ -425,11 +456,15 @@ struct SettingsView: View {
                 }
                 if preferences.translationModel == .custom {
                     TextField("OpenAI 模型 ID", text: $preferences.customTranslationModelID, prompt: Text("例如 gpt-6-luna"))
-                    Text("请输入你的 API 项目有权使用、支持 Responses API 文本输出的模型 ID。")
+                    Text("请输入项目可用的 Responses API 模型 ID。开启 Fast 前请确认该模型支持 Fast。")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
-                Text("模型更改在下次开始转写时生效。")
+                Toggle("翻译 Fast 模式", isOn: preferences.translationModel.allowsFast ? $preferences.fastTranslation : .constant(false))
+                    .disabled(!preferences.translationModel.allowsFast)
+                Text(preferences.translationModel.allowsFast
+                     ? "Fast 按 OpenAI 的加速费率计费。模型和 Fast 设置下次开始转写时生效。"
+                     : "此预设仅使用项目默认处理方式。模型更改在下次开始转写时生效。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -490,8 +525,9 @@ struct SettingsView: View {
                 }
             }
             Section("诊断日志") {
+                Toggle("记录诊断日志", isOn: $preferences.recordsDiagnostics)
                 Button("在 Finder 中显示日志", action: revealDiagnostics)
-                Text("日志最多 1 MiB，超出后删除最早的记录。")
+                Text("关闭后停止记录，已保存的日志仍可查看。日志最多 1 MiB，超出后删除最早的记录。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

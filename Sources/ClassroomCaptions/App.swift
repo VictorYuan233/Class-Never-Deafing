@@ -52,6 +52,10 @@ final class Preferences: ObservableObject {
     @Published var audioInputID = UserDefaults.standard.string(forKey: "audioInputID") ?? AudioInput.defaultID {
         didSet { UserDefaults.standard.set(audioInputID, forKey: "audioInputID") }
     }
+    @Published var segmentationLength = (UserDefaults.standard.object(forKey: "segmentationLength") as? Int)
+        .flatMap(SegmentationLength.init(rawValue:)) ?? .standard {
+        didSet { UserDefaults.standard.set(segmentationLength.rawValue, forKey: "segmentationLength") }
+    }
     @Published var exportFolder = UserDefaults.standard.string(forKey: "exportFolderPath")
         .map { URL(filePath: $0, directoryHint: .isDirectory) } {
         didSet { UserDefaults.standard.set(exportFolder?.path, forKey: "exportFolderPath") }
@@ -101,6 +105,12 @@ final class Preferences: ObservableObject {
     }
     @Published var customTranslationModelID = UserDefaults.standard.string(forKey: "customTranslationModelID") ?? "" {
         didSet { UserDefaults.standard.set(customTranslationModelID, forKey: "customTranslationModelID") }
+    }
+    @Published var fastTranslation = UserDefaults.standard.bool(forKey: "fastTranslation") {
+        didSet { UserDefaults.standard.set(fastTranslation, forKey: "fastTranslation") }
+    }
+    @Published var recordsDiagnostics = AppLog.isEnabled {
+        didSet { AppLog.setEnabled(recordsDiagnostics) }
     }
     @Published var floating = UserDefaults.standard.object(forKey: "floating") as? Bool ?? true {
         didSet { UserDefaults.standard.set(floating, forKey: "floating") }
@@ -311,7 +321,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard session.phase == .idle else { return }
         let translation: TranslationConfiguration
         do {
-            translation = try preferences.translationModel.configuration(customID: preferences.customTranslationModelID)
+            translation = try preferences.translationModel.configuration(
+                customID: preferences.customTranslationModelID, fast: preferences.fastTranslation
+            )
         } catch {
             openSettings()
             showError(error)
@@ -321,7 +333,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         session.start(
             source: .source(preferences.sourceID), target: .target(preferences.targetID),
             transcription: preferences.transcriptionModel, translation: translation,
-            audioInputID: preferences.audioInputID
+            audioInputID: preferences.audioInputID, segmentationLength: preferences.segmentationLength
         ) { [weak self] in
             try await self?.authorizeStart()
         }

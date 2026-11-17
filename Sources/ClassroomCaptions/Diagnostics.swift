@@ -1,11 +1,12 @@
 import Darwin
 import Foundation
+import os
 
 struct BoundedLogFile {
     let url: URL
     let maximumBytes: Int
 
-    func append(_ line: Data) throws {
+    func append(_ line: Data, shouldWrite: () -> Bool = { true }) throws {
         guard maximumBytes > 0, !line.isEmpty, line.count <= maximumBytes else { return }
         let folder = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
@@ -17,12 +18,14 @@ struct BoundedLogFile {
         while flock(lock, LOCK_EX) != 0 {
             guard errno == EINTR else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
         }
+        guard shouldWrite() else { return }
         // The folder lock remains valid even when the log is replaced atomically.
         if FileManager.default.fileExists(atPath: url.path) {
             let file = try FileHandle(forUpdating: url)
             defer { try? file.close() }
             let size = try file.seekToEnd()
             if size <= UInt64(maximumBytes - line.count) {
+                guard shouldWrite() else { return }
                 try file.write(contentsOf: line)
                 return
             }
@@ -37,6 +40,7 @@ struct BoundedLogFile {
                 updated.append(tail[tail.index(after: boundary)...])
             }
             updated.append(line)
+            guard shouldWrite() else { return }
             try replace(with: updated)
         } else {
             try replace(with: line)
@@ -50,7 +54,16 @@ struct BoundedLogFile {
 }
 
 enum AppLog {
+    private struct RecordingState {
+        var enabled: Bool
+        var generation: UInt64 = 0
+    }
+
     static let maximumBytes = 1024 * 1024
+    private static let recordingKey = "diagnosticsLoggingEnabled"
+    private static let recording = OSAllocatedUnfairLock(initialState: RecordingState(
+        enabled: UserDefaults.standard.object(forKey: recordingKey) as? Bool ?? true
+    ))
     private static let queue = DispatchQueue(label: "classroom-captions.diagnostics", qos: .utility)
     private static let formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -64,6 +77,18 @@ enum AppLog {
         maximumBytes: maximumBytes
     )
 
+    static var isEnabled: Bool { recording.withLock { $0.enabled } }
+
+    @MainActor
+    static func setEnabled(_ enabled: Bool) {
+        recording.withLock {
+            guard $0.enabled != enabled else { return }
+            $0.enabled = enabled
+            $0.generation &+= 1
+        }
+        UserDefaults.standard.set(enabled, forKey: recordingKey)
+    }
+
     static func launch(version: String, build: String) {
         write("app.launch", detail: "version=\(version) build=\(build)")
     }
@@ -76,6 +101,13 @@ enum AppLog {
         let duration = start.duration(to: .now).components
         let milliseconds = Int(duration.seconds * 1000 + duration.attoseconds / 1_000_000_000_000_000)
         event(name, number: milliseconds)
+    }
+
+    static func audioSignal(peak: Double, threshold: Double, voicedFrames: Int) {
+        func decibels(_ rms: Double) -> Int {
+            Int((20 * log10(max(1, rms) / 32_768)).rounded())
+        }
+        write("audio.signal_10s", detail: "peak_dbfs=\(decibels(peak)) gate_dbfs=\(decibels(threshold)) voiced_frames=\(voicedFrames)")
     }
 
     static func failure(_ name: StaticString, _ error: Error) {
@@ -104,12 +136,19 @@ enum AppLog {
 
     // Entries contain app-defined events and numeric codes, never request bodies or private strings.
     private static func write(_ event: StaticString, detail: String?) {
+        let generation = recording.withLock { $0.enabled ? $0.generation : nil }
+        guard let generation else { return }
         let timestamp = Date()
         queue.async {
+            // Drop queued lines from earlier recording periods, including after reenabling.
+            let shouldWrite = {
+                recording.withLock { $0.enabled && $0.generation == generation }
+            }
+            guard shouldWrite() else { return }
             let suffix = detail.map { " \($0)" } ?? ""
             let data = Data("\(formatter.string(from: timestamp)) \(event)\(suffix)\n".utf8)
             do {
-                try file.append(data)
+                try file.append(data, shouldWrite: shouldWrite)
             } catch {
                 let code = (error as NSError).code
                 NSLog("Class Never Deafing diagnostics write failed (%ld)", code)

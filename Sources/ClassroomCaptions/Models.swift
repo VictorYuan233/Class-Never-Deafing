@@ -1,5 +1,4 @@
 import Foundation
-import NaturalLanguage
 import Security
 
 struct Language: Identifiable, Equatable {
@@ -42,28 +41,91 @@ struct Caption: Identifiable {
     var translationLanguage = Language.simplified
 }
 
-enum TranslationSegments {
-    static func split(_ transcript: String) -> [String] {
-        let text = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return [] }
+struct TranscriptDrafts {
+    private struct Draft {
+        let connection: UUID
+        let item: String
+        var text: String
+    }
 
-        let tokenizer = NLTokenizer(unit: .sentence)
-        tokenizer.string = text
-        var groups: [String] = []
-        var groupStart = text.startIndex
-        var count = 0
-        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
-            count += 1
-            if count == 2 {
-                groups.append(String(text[groupStart..<range.upperBound]).trimmingCharacters(in: .whitespacesAndNewlines))
-                groupStart = range.upperBound
-                count = 0
-            }
-            return true
+    private var unbound: [Draft] = []
+    private var bound: [UUID: String] = [:]
+
+    @discardableResult
+    mutating func append(_ delta: String, connection: UUID, item: String) -> Bool {
+        if let index = unbound.firstIndex(where: { $0.connection == connection && $0.item == item }) {
+            unbound[index].text += delta
+            return false
         }
-        let tail = text[groupStart...].trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty { groups.append(tail) }
-        return groups
+        unbound.append(Draft(connection: connection, item: item, text: delta))
+        return true
+    }
+
+    mutating func bind(connection: UUID, item: String, to segment: UUID) {
+        guard let index = unbound.firstIndex(where: { $0.connection == connection && $0.item == item }) else { return }
+        bound[segment] = unbound.remove(at: index).text
+    }
+
+    @discardableResult
+    mutating func append(_ delta: String, to segment: UUID) -> Bool {
+        let isFirst = bound[segment] == nil
+        bound[segment, default: ""] += delta
+        return isFirst
+    }
+
+    @discardableResult
+    mutating func remove(_ segment: UUID) -> String? {
+        bound.removeValue(forKey: segment)
+    }
+
+    mutating func remove(connection: UUID) {
+        unbound.removeAll { $0.connection == connection }
+    }
+
+    func newest(activeConnection: UUID?, indices: [UUID: Int]) -> String {
+        if let newest = unbound.last(where: { $0.connection == activeConnection }) {
+            return newest.text
+        }
+        let newest = bound.keys.max { indices[$0, default: -1] < indices[$1, default: -1] }
+        return newest.flatMap { bound[$0] } ?? ""
+    }
+}
+
+enum SegmentationLength: Int, CaseIterable {
+    case short, standard, longer, long, extended
+
+    struct Limits {
+        let pauseFrames: Int
+        let longTurnPauseFrames: Int
+        let longTurnFrames: Int
+        let maximumFrames: Int
+    }
+
+    var title: String {
+        switch self {
+        case .short: "短"
+        case .standard: "标准"
+        case .longer: "偏长"
+        case .long: "长"
+        case .extended: "最长"
+        }
+    }
+
+    var limits: Limits {
+        switch self {
+        case .short: .init(pauseFrames: 30, longTurnPauseFrames: 16, longTurnFrames: 260, maximumFrames: 400)
+        case .standard: .init(pauseFrames: 42, longTurnPauseFrames: 22, longTurnFrames: 400, maximumFrames: 600)
+        case .longer: .init(pauseFrames: 55, longTurnPauseFrames: 28, longTurnFrames: 520, maximumFrames: 800)
+        case .long: .init(pauseFrames: 70, longTurnPauseFrames: 34, longTurnFrames: 720, maximumFrames: 1100)
+        case .extended: .init(pauseFrames: 75, longTurnPauseFrames: 75, longTurnFrames: 1500, maximumFrames: 1500)
+        }
+    }
+
+    var detail: String {
+        let timing = limits
+        let pause = Double(timing.pauseFrames) / 50
+        let maximum = timing.maximumFrames / 50
+        return "\(title) · 停顿约 \(pause.formatted(.number.precision(.fractionLength(1...2)))) 秒 · 每段最长 \(maximum) 秒"
     }
 }
 
@@ -102,29 +164,35 @@ enum TranslationModel: String, CaseIterable, Identifiable {
         }
     }
 
-    func configuration(customID: String = "") throws -> TranslationConfiguration {
+    var allowsFast: Bool {
+        self != .mini54 && self != .mini41
+    }
+
+    func configuration(customID: String = "", fast: Bool = false) throws -> TranslationConfiguration {
+        let serviceTier = fast && allowsFast ? "fast" : nil
         switch self {
         case .custom:
             let id = customID.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !id.isEmpty, id.rangeOfCharacter(from: .whitespacesAndNewlines.union(.controlCharacters)) == nil else {
                 throw AppFailure.translationModelName
             }
-            return TranslationConfiguration(id: id, reasoningEffort: nil)
+            return TranslationConfiguration(id: id, reasoningEffort: nil, serviceTier: serviceTier)
         case .luna, .terra, .mini54:
-            return TranslationConfiguration(id: rawValue, reasoningEffort: "none")
+            return TranslationConfiguration(id: rawValue, reasoningEffort: "none", serviceTier: serviceTier)
         case .sol, .astra:
-            return TranslationConfiguration(id: rawValue, reasoningEffort: "low")
+            return TranslationConfiguration(id: rawValue, reasoningEffort: "low", serviceTier: serviceTier)
         case .mini41:
-            return TranslationConfiguration(id: rawValue, reasoningEffort: nil)
+            return TranslationConfiguration(id: rawValue, reasoningEffort: nil, serviceTier: serviceTier)
         }
     }
 }
 
 struct TranslationConfiguration: Equatable {
-    static let defaultModel = TranslationConfiguration(id: TranslationModel.luna.rawValue, reasoningEffort: "none")
+    static let defaultModel = TranslationConfiguration(id: TranslationModel.luna.rawValue, reasoningEffort: "none", serviceTier: nil)
 
     let id: String
     let reasoningEffort: String?
+    let serviceTier: String?
 }
 
 enum CaptionFontDesign: String, CaseIterable, Codable, Identifiable {
