@@ -322,6 +322,25 @@ struct RecordingClock {
     }
 }
 
+enum PrivateDataLocation {
+    static func check(_ url: URL) throws {
+        let location = url.standardizedFileURL
+        try checkAncestors(of: location)
+        try checkAncestors(of: location.resolvingSymlinksInPath())
+    }
+
+    private static func checkAncestors(of url: URL) throws {
+        var location = url
+        while location.path != "/" {
+            let metadata = location.appendingPathComponent(".git").path
+            if location.lastPathComponent == ".git" || FileManager.default.fileExists(atPath: metadata) {
+                throw AppFailure.privateDataInRepository
+            }
+            location.deleteLastPathComponent()
+        }
+    }
+}
+
 struct SessionExport {
     static let fileExtensions = ["mp3", "wav", "txt"]
     let folder: URL
@@ -337,7 +356,9 @@ struct SessionExport {
 
     func url(endingIn fileExtension: String) throws -> URL {
         try Self.prepare(folder: folder, createFolder: createFolder)
-        return fileURL(endingIn: fileExtension)
+        let url = fileURL(endingIn: fileExtension)
+        try PrivateDataLocation.check(url)
+        return url
     }
 
     func fileURL(endingIn fileExtension: String) -> URL {
@@ -367,6 +388,7 @@ struct SessionExport {
     }
 
     static func prepare(folder: URL, createFolder: Bool) throws {
+        try PrivateDataLocation.check(folder)
         if createFolder {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         } else {
@@ -407,6 +429,7 @@ enum ExportArchive {
 
     static func removeExpired(in folder: URL, after days: Int, now: Date = .now) throws {
         guard days > 0 else { return }
+        try PrivateDataLocation.check(folder)
         let cutoff = now.addingTimeInterval(-Double(days) * 86_400)
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isSymbolicLinkKey, .contentModificationDateKey]
         let manager = FileManager.default
@@ -468,6 +491,7 @@ enum AppFailure: LocalizedError {
     case audioOverload
     case timeout
     case modelName
+    case privateDataInRepository
     case api(String, retryable: Bool)
 
     var errorDescription: String? {
@@ -483,6 +507,7 @@ enum AppFailure: LocalizedError {
         case .audioOverload: "音频处理或网络发送跟不上，部分音频未能转写。"
         case .timeout: "连接 OpenAI 超时。"
         case .modelName: "请输入完整的模型 ID，ID 中不能有空格或换行。"
+        case .privateDataInRepository: "这个位置位于 Git 仓库中。请选择仓库之外的文件夹保存个人数据。"
         case .api(let message, _): message
         }
     }
@@ -500,6 +525,7 @@ enum AppFailure: LocalizedError {
         case .audioOverload: "audio_overload"
         case .timeout: "connection_timeout"
         case .modelName: "invalid_model_id"
+        case .privateDataInRepository: "private_data_in_repository"
         case .api(_, let retryable): "openai_error retryable=\(retryable)"
         }
     }

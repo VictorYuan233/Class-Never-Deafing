@@ -24,6 +24,7 @@ struct CoreChecks {
         checkCaptionScroll()
         checkRecordingClock()
         try checkExport()
+        try checkPrivateDataLocation()
         try checkExportArchive()
         try await checkSessionRecording()
         print("通过：独立 API 地址与密钥、密钥加密和错误脱敏、翻译与转写请求、字幕窗快捷键、诊断日志、音频分段、字幕录音配对保存。")
@@ -459,6 +460,47 @@ struct CoreChecks {
         let unavailable = folder.appending(path: "disconnected-folder", directoryHint: .isDirectory)
         let write = try? TextExport.saveAutomatically(exported, to: .init(folder: unavailable, createFolder: false, name: SessionExport.name()))
         precondition(write == nil && !FileManager.default.fileExists(atPath: unavailable.path))
+    }
+
+    private static func checkPrivateDataLocation() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let repo = folder.appending(path: "source", directoryHint: .isDirectory)
+        let worktree = folder.appending(path: "worktree", directoryHint: .isDirectory)
+        defer { try? fm.removeItem(at: folder) }
+        try fm.createDirectory(at: repo.appending(path: ".git", directoryHint: .isDirectory), withIntermediateDirectories: true)
+        try fm.createDirectory(at: worktree, withIntermediateDirectories: true)
+        try Data().write(to: worktree.appending(path: ".git"))
+        let link = folder.appending(path: "linked")
+        try fm.createSymbolicLink(at: link, withDestinationURL: repo)
+        let linkedFile = folder.appending(path: "linked.txt")
+        let repoFile = repo.appending(path: "notes.txt")
+        try Data().write(to: repoFile)
+        try fm.createSymbolicLink(at: linkedFile, withDestinationURL: repoFile)
+
+        func denied(_ action: () throws -> Void) throws {
+            do {
+                try action()
+                preconditionFailure("Private data destination inside Git was accepted")
+            } catch AppFailure.privateDataInRepository {}
+        }
+
+        try PrivateDataLocation.check(folder.appending(path: "private/output"))
+        for destination in [repo, worktree, link] {
+            let nested = destination.appending(path: "output", directoryHint: .isDirectory)
+            try denied { try SessionExport.prepare(folder: nested, createFolder: true) }
+            precondition(!fm.fileExists(atPath: nested.path))
+        }
+        try denied { try PrivateDataLocation.check(linkedFile) }
+        try denied {
+            try APIKeyStore(folder: repo.appending(path: "keys")).save(
+                "test-only", role: .transcription, endpoint: APIEndpoint(""))
+        }
+        precondition(!fm.fileExists(atPath: repo.appending(path: "keys").path))
+        try denied {
+            _ = try ExportArchive.saveCopy(text: "fixture", audio: nil,
+                                            to: SessionExport(folder: worktree, createFolder: false, name: "session"))
+        }
     }
 
     private static func checkExportArchive() throws {

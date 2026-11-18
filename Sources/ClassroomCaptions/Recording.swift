@@ -47,6 +47,8 @@ final class SessionRecording: @unchecked Sendable {
             guard self.outcome == nil, !self.writeFailed else { return }
             do {
                 if self.file == nil {
+                    try PrivateDataLocation.check(self.stagingFolder)
+                    try PrivateDataLocation.check(self.stagingURL)
                     try FileManager.default.createDirectory(at: self.stagingFolder, withIntermediateDirectories: true,
                                                             attributes: [.posixPermissions: 0o700])
                     self.file = try AVAudioFile(forWriting: self.stagingURL, settings: buffer.format.settings,

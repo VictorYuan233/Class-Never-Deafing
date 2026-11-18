@@ -102,9 +102,13 @@ struct APIKeyStore {
 
     func save(_ input: String, role: APIRole, endpoint: APIEndpoint) throws {
         let credential = Credential(endpoint: endpoint.base, key: try APIConnection.validateKey(input))
+        let file = folder.appending(path: "local.key")
+        let destination = credentialURL(role)
+        try PrivateDataLocation.check(folder)
+        try PrivateDataLocation.check(file)
+        try PrivateDataLocation.check(destination)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        let file = folder.appending(path: "local.key")
         if !FileManager.default.fileExists(atPath: file.path) {
             let data = SymmetricKey(size: .bits256).withUnsafeBytes { Data($0) }
             try data.write(to: file, options: .withoutOverwriting)
@@ -112,7 +116,6 @@ struct APIKeyStore {
         }
         let sealed = try AES.GCM.seal(JSONEncoder().encode(credential), using: readKey(),
                                       authenticating: Data(role.rawValue.utf8))
-        let destination = credentialURL(role)
         try sealed.combined!.write(to: destination, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
     }

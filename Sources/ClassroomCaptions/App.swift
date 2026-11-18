@@ -65,8 +65,12 @@ final class Preferences: ObservableObject {
     }() {
         didSet { UserDefaults.standard.set(silencePauseMinutes, forKey: "silencePauseMinutes") }
     }
-    @Published var exportFolder = UserDefaults.standard.string(forKey: "exportFolderPath")
-        .map { URL(filePath: $0, directoryHint: .isDirectory) } {
+    @Published var exportFolder: URL? = {
+        guard let path = UserDefaults.standard.string(forKey: "exportFolderPath") else { return nil }
+        let folder = URL(filePath: path, directoryHint: .isDirectory)
+        guard (try? PrivateDataLocation.check(folder)) != nil else { return nil }
+        return folder
+    }() {
         didSet { UserDefaults.standard.set(exportFolder?.path, forKey: "exportFolderPath") }
     }
     @Published var automaticSave = UserDefaults.standard.object(forKey: "automaticSave") as? Bool ?? true {
@@ -211,7 +215,7 @@ final class CaptionPanel: NSPanel {
 }
 
 @MainActor
-final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOpenSavePanelDelegate {
     let session = ClassroomSession()
     let preferences = Preferences()
     private let transcriptionKey = APIKeySettings(role: .transcription)
@@ -471,6 +475,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         picker.message = error.map { "未能另存，请选择其他文件名或文件夹。\n\($0)" }
             ?? "录音和字幕将使用同一名称。"
         picker.canCreateDirectories = true
+        picker.delegate = self
         picker.directoryURL = preferences.exportFolder ?? TextExport.automaticFolder
         picker.nameFieldStringValue = suggestedName
         showPanel()
@@ -657,9 +662,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         picker.canChooseDirectories = true
         picker.canCreateDirectories = true
         picker.allowsMultipleSelection = false
+        picker.delegate = self
         picker.directoryURL = preferences.exportFolder ?? FileManager.default.homeDirectoryForCurrentUser
         picker.beginSheetModal(for: settings) { [weak self] response in
-            if response == .OK, let url = picker.url { self?.preferences.exportFolder = url }
+            guard response == .OK, let url = picker.url, let self else { return }
+            do {
+                try PrivateDataLocation.check(url)
+                self.preferences.exportFolder = url
+            } catch {
+                self.showError(error)
+            }
         }
     }
 
@@ -683,6 +695,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let dialog = NSSavePanel()
         dialog.allowedContentTypes = [.plainText]
         dialog.canCreateDirectories = true
+        dialog.delegate = self
         dialog.directoryURL = preferences.exportFolder ?? TextExport.automaticFolder
         let date = DateFormatter()
         date.locale = Locale(identifier: "en_US_POSIX")
@@ -691,6 +704,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         guard dialog.runModal() == .OK, let url = dialog.url else { return }
         do {
+            try PrivateDataLocation.check(url.deletingLastPathComponent())
+            try PrivateDataLocation.check(url)
             try content.write(to: url, atomically: true, encoding: .utf8)
             let alert = NSAlert()
             alert.messageText = "课堂文本已保存"
@@ -705,6 +720,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let alert = NSAlert(error: error)
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
+    }
+
+    func panel(_ sender: Any, validate url: URL) throws {
+        try PrivateDataLocation.check(url.deletingLastPathComponent())
+        try PrivateDataLocation.check(url)
     }
 
     @objc private func quit() {
