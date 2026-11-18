@@ -378,6 +378,7 @@ final class APIKeySettings: ObservableObject {
 }
 
 struct SettingsView: View {
+    @StateObject private var help = SettingsHelp()
     @ObservedObject var preferences: Preferences
     @ObservedObject var transcriptionKey: APIKeySettings
     @ObservedObject var translationKey: APIKeySettings
@@ -393,17 +394,17 @@ struct SettingsView: View {
                 Picker("源语言", selection: $preferences.sourceID) {
                     ForEach(Language.sources) { Text($0.label).tag($0.id) }
                 }
-                .help("录制时可在字幕窗切换，下一段原文使用新的源语言。")
+                .settingsHelp("录制时可在字幕窗切换，下一段原文使用新的源语言。")
                 Picker("目标语言", selection: $preferences.targetID) {
                     ForEach(Language.targets) { Text($0.label).tag($0.id) }
                 }
-                .help("录制时可在字幕窗切换，之后提交翻译的段落使用新的目标语言。")
+                .settingsHelp("录制时可在字幕窗切换，之后提交翻译的段落使用新的目标语言。")
             }
             Section("音频输入") {
                 Picker("输入源", selection: $preferences.audioInputID) {
                     ForEach(preferences.audioChoices) { Text($0.label).tag($0.id) }
                 }
-                .help("下次开始录制时生效。系统声音需要 macOS 的屏幕与系统音频录制权限。")
+                .settingsHelp("下次开始录制时生效。系统声音需要 macOS 的屏幕与系统音频录制权限。")
             }
             Section("分句") {
                 Slider(value: Binding(
@@ -421,19 +422,19 @@ struct SettingsView: View {
                     Text("长")
                 }
                 .accessibilityValue(preferences.segmentationLength.title)
-                .help("\(preferences.segmentationLength.detail)。下次开始转写时生效。")
+                .settingsHelp("\(preferences.segmentationLength.detail)。下次开始转写时生效。")
             }
             Section("自动暂停") {
                 Toggle("无声时自动暂停", isOn: $preferences.silencePauseEnabled)
-                    .help("达到无声时长后停止采音和计时，点击「继续」可接着转写。")
+                    .settingsHelp("达到无声时长后停止采音和计时，点击「继续」可接着转写。")
                 Stepper("无声时长：\(preferences.silencePauseMinutes) 分钟", value: $preferences.silencePauseMinutes,
                         in: SilenceAutoPause.minutes)
                     .disabled(!preferences.silencePauseEnabled)
-                    .help("设置触发自动暂停前的无声时间。")
+                    .settingsHelp("设置触发自动暂停前的无声时间。")
             }
             Section("保存") {
                 Toggle("自动保存录音和字幕", isOn: $preferences.automaticSave)
-                    .help("设置在下次开始转写时生效。关闭后，仍可用「停止并另存为」手动保存。")
+                    .settingsHelp("设置在下次开始转写时生效。关闭后，仍可用「停止并另存为」手动保存。")
                 LabeledContent("录音和字幕保留天数") {
                     TextField("录音和字幕保留天数", value: Binding(
                         get: { preferences.retentionDays },
@@ -444,27 +445,31 @@ struct SettingsView: View {
                     .frame(width: 74)
                 }
                 .disabled(!preferences.automaticSave)
-                .help("0 表示无限期保留。每次自动保存后清理默认目录中过期的自动记录。")
+                .settingsHelp("0 表示无限期保留。每次自动保存后清理默认目录中过期的自动记录。")
                 LabeledContent("默认保存目录") {
                     Text(((preferences.exportFolder ?? TextExport.automaticFolder).path as NSString).abbreviatingWithTildeInPath)
                         .multilineTextAlignment(.trailing)
                         .textSelection(.enabled)
                 }
+                .settingsHelp("停止时自动将录音和字幕存到此目录。")
                 HStack {
                     Spacer()
                     if preferences.exportFolder != nil {
                         Button("恢复默认目录") { preferences.exportFolder = nil }
+                            .settingsHelp("恢复 App 自带的课堂记录目录。")
                     }
                     Button("选择文件夹…", action: chooseExportFolder)
-                        .help("选择录音和字幕的默认保存目录。")
+                        .settingsHelp("选择录音和字幕的默认保存目录。")
                 }
             }
             Section("字幕窗") {
                 Toggle("始终置顶", isOn: $preferences.floating)
+                    .settingsHelp("开启后，字幕窗会浮在其他普通窗口上方。")
                 ColorPicker("背景颜色", selection: Binding(
                     get: { Color(nsColor: preferences.background) },
                     set: { preferences.background = NSColor($0) }
                 ), supportsOpacity: false)
+                .settingsHelp("更改字幕窗的背景颜色。")
                 LabeledContent("背景不透明度") {
                     Slider(value: $preferences.opacity, in: 0...1)
                         .accessibilityLabel("背景不透明度")
@@ -472,6 +477,7 @@ struct SettingsView: View {
                         .monospacedDigit()
                         .frame(width: 42)
                 }
+                .settingsHelp("向左调低可让字幕窗背景更透明。")
             }
             Section("原文字幕字体") {
                 fontControls($preferences.originalTypography, colorLabel: "原文字体颜色")
@@ -482,39 +488,51 @@ struct SettingsView: View {
             Section("转写") {
                 TextField("转写 API 地址", text: $preferences.transcriptionAddress, prompt: Text(APIEndpoint.openAI.absoluteString))
                     .onChange(of: preferences.transcriptionAddress) { _, _ in transcriptionKey.clearTest() }
-                    .help("填服务商提供的 API 基础地址。留空使用 OpenAI，下次开始转写时生效。")
-                Picker("转写模型", selection: $preferences.transcriptionModel) {
-                    ForEach(TranscriptionModel.allCases) { Text($0.label).tag($0) }
+                    .settingsHelp("填服务商提供的 API 基础地址。留空使用 OpenAI，下次开始转写时生效。")
+                LabeledContent("转写模型") {
+                    DefaultChoicePicker(title: "转写模型", selection: $preferences.transcriptionModel,
+                                        choices: TranscriptionModel.allCases, defaultChoice: TranscriptionModel.defaultChoice,
+                                        label: \.label)
+                        .fixedSize()
                 }
                 .onChange(of: preferences.transcriptionModel) { _, _ in transcriptionKey.clearTest() }
-                .help("两个预设使用 Realtime 接口。自定义模型使用兼容的 /audio/transcriptions 接口，分段后转写。")
+                .settingsHelp(TranscriptionModel.allCases.map { "\($0.label) · \($0.help)" }.joined(separator: "\n"))
                 if preferences.transcriptionModel == .custom {
                     TextField("转写模型 ID", text: $preferences.customTranscriptionModelID, prompt: Text("例如 whisper-1"))
                         .onChange(of: preferences.customTranscriptionModelID) { _, _ in transcriptionKey.clearTest() }
+                        .settingsHelp("输入服务商提供的音频转写模型 ID。")
                 }
                 apiControls(transcriptionKey)
             }
             Section("翻译") {
                 TextField("翻译 API 地址", text: $preferences.translationAddress, prompt: Text(APIEndpoint.openAI.absoluteString))
                     .onChange(of: preferences.translationAddress) { _, _ in translationKey.clearTest() }
-                    .help("填服务商提供的 API 基础地址。留空使用 OpenAI，下次开始转写时生效。")
-                Picker("翻译接口", selection: $preferences.translationFormat) {
-                    ForEach(TranslationProtocol.allCases) { Text($0.title).tag($0) }
+                    .settingsHelp("填服务商提供的 API 基础地址。留空使用 OpenAI，下次开始转写时生效。")
+                LabeledContent("翻译接口") {
+                    DefaultChoicePicker(title: "翻译接口", selection: $preferences.translationFormat,
+                                        choices: TranslationProtocol.allCases, defaultChoice: TranslationProtocol.defaultChoice,
+                                        label: \.title)
+                        .fixedSize()
                 }
                 .onChange(of: preferences.translationFormat) { _, _ in translationKey.clearTest() }
-                .help(TranslationProtocol.help)
-                Picker("翻译模型", selection: $preferences.translationModel) {
-                    ForEach(TranslationModel.allCases) { Text($0.label).tag($0) }
+                .settingsHelp(TranslationProtocol.help)
+                LabeledContent("翻译模型") {
+                    DefaultChoicePicker(title: "翻译模型", selection: $preferences.translationModel,
+                                        choices: TranslationModel.allCases, defaultChoice: TranslationModel.defaultChoice,
+                                        label: \.label)
+                        .fixedSize()
                 }
                 .onChange(of: preferences.translationModel) { _, _ in translationKey.clearTest() }
+                .settingsHelp("选择生成译文的模型。服务商提供其他模型时，可选「自定义」。")
                 if preferences.translationModel == .custom {
                     TextField("翻译模型 ID", text: $preferences.customTranslationModelID, prompt: Text("例如 gpt-6-luna"))
                         .onChange(of: preferences.customTranslationModelID) { _, _ in translationKey.clearTest() }
+                        .settingsHelp("输入服务商提供的文本模型 ID，再点「测试翻译」。")
                 }
                 Toggle("翻译 Fast 模式", isOn: preferences.translationModel.allowsFast ? $preferences.fastTranslation : .constant(false))
                     .disabled(!preferences.translationModel.allowsFast)
                     .onChange(of: preferences.fastTranslation) { _, _ in translationKey.clearTest() }
-                    .help("开启时会请求 Fast。支持情况与费用取决于所选模型和服务商。")
+                    .settingsHelp("开启时会请求 Fast。支持情况与费用取决于所选模型和服务商。")
                 apiControls(translationKey)
             }
             Section("快捷键") {
@@ -528,10 +546,11 @@ struct SettingsView: View {
                             }
                             .accessibilityLabel("\(action.title)快捷键")
                             .accessibilityValue(isRecording ? "等待输入" : shortcut?.display ?? "未设置")
-                            .help(isRecording ? "按 Esc 可取消录制。" : "设定后可在其他 App 中使用。")
+                            .settingsHelp(isRecording ? "按 Esc 可取消录制。" : "设定后可在其他 App 中使用。")
                             if shortcut != nil {
                                 Button("清除") { shortcuts.clear(action) }
                                     .accessibilityLabel("清除\(action.title)快捷键")
+                                    .settingsHelp("移除当前快捷键组合。")
                             }
                         }
                     }
@@ -542,17 +561,23 @@ struct SettingsView: View {
             }
             Section("诊断日志") {
                 Toggle("记录诊断日志", isOn: $preferences.recordsDiagnostics)
-                    .help("关闭后停止记录，已保存的日志仍可查看。日志最多 1 MiB，超出后删除最早的记录。")
+                    .settingsHelp("关闭后停止记录，已保存的日志仍可查看。日志最多 1 MiB，超出后删除最早的记录。")
                 Button("在 Finder 中显示日志", action: revealDiagnostics)
+                    .settingsHelp("在 Finder 中定位诊断日志文件。")
             }
             Section {
                 HStack {
                     Button("使用指南", action: openGuide)
+                        .settingsHelp("查看字幕、模型和保存选项的使用说明。")
                     Button("关于", action: openAbout)
+                        .settingsHelp("查看 App 版本、系统要求和本版更新。")
                 }
             }
         }
         .formStyle(.grouped)
+        .environmentObject(help)
+        .onDisappear { help.dismiss() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didResignKeyNotification)) { _ in help.dismiss() }
         .onChange(of: preferences.targetID) { _, _ in translationKey.clearTest() }
         .onAppear {
             transcriptionKey.refresh()
@@ -565,22 +590,23 @@ struct SettingsView: View {
         SecureField("\(key.role.title) API Key", text: Binding(get: { key.entry }, set: { key.entry = $0 }),
                     prompt: Text(key.hasSavedKey ? "输入新 Key 以替换" : "粘贴 API Key"))
             .onSubmit { if key.hasEntry { key.save(preferences) } }
-            .help(key.keyHelp)
+            .settingsHelp(key.keyHelp)
         if let error = key.keyError {
             Text(error).font(.caption).foregroundStyle(.red).textSelection(.enabled)
         }
         HStack {
             if key.hasSavedKey {
                 Button("删除\(key.role.title) Key", role: .destructive) { key.delete() }
+                    .settingsHelp("清除这组设置在本机保存的 API Key。")
             }
             Spacer()
             Button("保存\(key.role.title) Key") { key.save(preferences) }
                 .disabled(!key.hasEntry || key.isTesting)
-                .help("将 API Key 加密保存到本机。")
+                .settingsHelp("将 API Key 加密保存到本机。")
             Button(key.isTesting ? "取消测试" : "测试\(key.role.title)") {
                 if key.isTesting { key.clearTest() } else { key.test(preferences) }
             }
-            .help(key.isTesting ? "取消本次测试请求。" : key.role == .transcription
+            .settingsHelp(key.isTesting ? "取消本次测试请求。" : key.role == .transcription
                   ? "发送内置音频样例，测试可能计费。"
                   : "发送一句固定文本测试翻译，测试可能计费。")
         }
@@ -597,11 +623,15 @@ struct SettingsView: View {
         Picker("字体样式", selection: style.design) {
             ForEach(CaptionFontDesign.allCases) { Text($0.label).tag($0) }
         }
+        .settingsHelp("选择字幕使用的字体样式。")
         Stepper(value: style.size, in: CaptionTypography.sizes) {
             LabeledContent("字号", value: "\(style.wrappedValue.size) pt")
         }
+        .settingsHelp("增大或减小字幕字号。")
         Toggle("粗体", isOn: style.bold)
+            .settingsHelp("用粗体显示字幕。")
         Toggle("斜体", isOn: style.italic)
+            .settingsHelp("用斜体显示字幕。")
         ColorPicker(colorLabel, selection: Binding(
             get: { style.wrappedValue.color?.swiftUIColor ?? preferences.panelForeground },
             set: { input in
@@ -610,8 +640,10 @@ struct SettingsView: View {
                 }
             }
         ), supportsOpacity: false)
+        .settingsHelp("为这组字幕指定文字颜色。")
         if style.wrappedValue.color != nil {
             Button("恢复自动颜色") { style.wrappedValue.color = nil }
+                .settingsHelp("根据字幕窗背景自动选择易读的文字颜色。")
         }
     }
 

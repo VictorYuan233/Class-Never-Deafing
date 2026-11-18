@@ -139,6 +139,7 @@ struct TranscriptionService {
 
 enum TranslationProtocol: String, CaseIterable, Identifiable {
     case responses, chat
+    static let defaultChoice: Self = .responses
 
     var id: Self { self }
     var title: String { self == .responses ? "Responses" : "Chat Completions" }

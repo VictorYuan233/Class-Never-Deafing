@@ -3,12 +3,13 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>0.10.1</string>
+    <string>1.0.0</string>
     <key>highlights</key>
     <array>
-        <string>调整设置顺序，转写和翻译 API 位于字体和快捷键之间。</string>
-        <string>功能说明改为悬停提示，翻译接口提示包含 Responses 与 Chat Completions 的区别。</string>
-        <string>移除字幕窗停止后出现的文件夹按钮，设置底部的「详情」更名为「关于」。</string>
+        <string>换上浅薰衣草双气泡应用图标。</string>
+        <string>在设置控件上停留约一秒即可查看操作说明。</string>
+        <string>转写下拉菜单只显示模型名称，三个 API 下拉菜单标注默认选项。</string>
+        <string>从 Spotlight 重新打开已运行的 App 时，显示字幕窗。</string>
     </array>
 </dict>
 </plist>

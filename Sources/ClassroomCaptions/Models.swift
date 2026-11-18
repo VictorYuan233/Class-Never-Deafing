@@ -159,13 +159,22 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
     case live = "gpt-live-transcribe"
     case committed = "gpt-transcribe"
     case custom
+    static let defaultChoice: Self = .live
 
     var id: String { rawValue }
     var label: String {
         switch self {
-        case .live: "GPT-Live-Transcribe · 实时"
-        case .committed: "GPT-Transcribe · 分段后转写"
-        case .custom: "自定义 · 分段后转写"
+        case .live: "GPT-Live-Transcribe"
+        case .committed: "GPT-Transcribe"
+        case .custom: "自定义"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .live: "通过 Realtime 接口边听边显示原文。"
+        case .committed: "通过 Realtime 接口，在每段音频提交后返回原文。"
+        case .custom: "每段结束后通过服务商的 /audio/transcriptions 接口转写。"
         }
     }
 
@@ -187,6 +196,7 @@ enum TranslationModel: String, CaseIterable, Identifiable {
     case mini54 = "gpt-5.4-mini-2026-03-17"
     case mini41 = "gpt-4.1-mini"
     case custom
+    static let defaultChoice: Self = .luna
 
     var id: String { rawValue }
     var label: String {

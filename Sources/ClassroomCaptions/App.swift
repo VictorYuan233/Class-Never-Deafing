@@ -111,7 +111,7 @@ final class Preferences: ObservableObject {
         }
     }
     @Published var transcriptionModel = UserDefaults.standard.string(forKey: "transcriptionModel")
-        .flatMap(TranscriptionModel.init(rawValue:)) ?? .live {
+        .flatMap(TranscriptionModel.init(rawValue:)) ?? TranscriptionModel.defaultChoice {
         didSet { UserDefaults.standard.set(transcriptionModel.rawValue, forKey: "transcriptionModel") }
     }
     @Published var transcriptionAddress = UserDefaults.standard.string(forKey: "transcriptionAddress") ?? "" {
@@ -124,11 +124,11 @@ final class Preferences: ObservableObject {
         didSet { UserDefaults.standard.set(customTranscriptionModelID, forKey: "customTranscriptionModelID") }
     }
     @Published var translationFormat = UserDefaults.standard.string(forKey: "translationFormat")
-        .flatMap(TranslationProtocol.init(rawValue:)) ?? .responses {
+        .flatMap(TranslationProtocol.init(rawValue:)) ?? TranslationProtocol.defaultChoice {
         didSet { UserDefaults.standard.set(translationFormat.rawValue, forKey: "translationFormat") }
     }
     @Published var translationModel = UserDefaults.standard.string(forKey: "translationModel")
-        .flatMap(TranslationModel.init(rawValue:)) ?? .luna {
+        .flatMap(TranslationModel.init(rawValue:)) ?? TranslationModel.defaultChoice {
         didSet { UserDefaults.standard.set(translationModel.rawValue, forKey: "translationModel") }
     }
     @Published var customTranslationModelID = UserDefaults.standard.string(forKey: "customTranslationModelID") ?? "" {
@@ -534,6 +534,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         fitPanelOnScreen()
         panel.orderFrontRegardless()
         panel.alignToolbar()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showPanel()
+        return false
     }
 
     func windowDidResize(_ notification: Notification) {
