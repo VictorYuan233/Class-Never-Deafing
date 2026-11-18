@@ -69,6 +69,12 @@ final class Preferences: ObservableObject {
         .map { URL(filePath: $0, directoryHint: .isDirectory) } {
         didSet { UserDefaults.standard.set(exportFolder?.path, forKey: "exportFolderPath") }
     }
+    @Published var automaticSave = UserDefaults.standard.object(forKey: "automaticSave") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(automaticSave, forKey: "automaticSave") }
+    }
+    @Published var retentionDays = max(0, UserDefaults.standard.integer(forKey: "retentionDays")) {
+        didSet { UserDefaults.standard.set(retentionDays, forKey: "retentionDays") }
+    }
     @Published private(set) var audioInputs: [AudioInput] = []
     var audioChoices: [AudioChoice] {
         var choices = [
@@ -108,6 +114,19 @@ final class Preferences: ObservableObject {
         .flatMap(TranscriptionModel.init(rawValue:)) ?? .live {
         didSet { UserDefaults.standard.set(transcriptionModel.rawValue, forKey: "transcriptionModel") }
     }
+    @Published var transcriptionAddress = UserDefaults.standard.string(forKey: "transcriptionAddress") ?? "" {
+        didSet { UserDefaults.standard.set(transcriptionAddress, forKey: "transcriptionAddress") }
+    }
+    @Published var translationAddress = UserDefaults.standard.string(forKey: "translationAddress") ?? "" {
+        didSet { UserDefaults.standard.set(translationAddress, forKey: "translationAddress") }
+    }
+    @Published var customTranscriptionModelID = UserDefaults.standard.string(forKey: "customTranscriptionModelID") ?? "" {
+        didSet { UserDefaults.standard.set(customTranscriptionModelID, forKey: "customTranscriptionModelID") }
+    }
+    @Published var translationFormat = UserDefaults.standard.string(forKey: "translationFormat")
+        .flatMap(TranslationProtocol.init(rawValue:)) ?? .responses {
+        didSet { UserDefaults.standard.set(translationFormat.rawValue, forKey: "translationFormat") }
+    }
     @Published var translationModel = UserDefaults.standard.string(forKey: "translationModel")
         .flatMap(TranslationModel.init(rawValue:)) ?? .luna {
         didSet { UserDefaults.standard.set(translationModel.rawValue, forKey: "translationModel") }
@@ -117,6 +136,20 @@ final class Preferences: ObservableObject {
     }
     @Published var fastTranslation = UserDefaults.standard.bool(forKey: "fastTranslation") {
         didSet { UserDefaults.standard.set(fastTranslation, forKey: "fastTranslation") }
+    }
+
+    func endpoint(_ role: APIRole) throws -> APIEndpoint {
+        try APIEndpoint(role == .transcription ? transcriptionAddress : translationAddress)
+    }
+
+    func transcription(using connection: APIConnection) throws -> TranscriptionService {
+        try TranscriptionService(connection: connection, selection: transcriptionModel,
+                                 modelID: transcriptionModel.modelID(customID: customTranscriptionModelID))
+    }
+
+    func translation(using connection: APIConnection) throws -> TranslationService {
+        try TranslationService(connection: connection, format: translationFormat,
+                               model: translationModel.configuration(customID: customTranslationModelID, fast: fastTranslation))
     }
     @Published var recordsDiagnostics = AppLog.isEnabled {
         didSet { AppLog.setEnabled(recordsDiagnostics) }
@@ -181,7 +214,8 @@ final class CaptionPanel: NSPanel {
 final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let session = ClassroomSession()
     let preferences = Preferences()
-    private let keySettings = KeySettings()
+    private let transcriptionKey = APIKeySettings(role: .transcription)
+    private let translationKey = APIKeySettings(role: .translation)
     private let shortcuts = CaptionShortcuts()
     private var statusItem: NSStatusItem?
     private let statusMenu = NSMenu()
@@ -191,8 +225,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var subscriptions = Set<AnyCancellable>()
     private var audioDevicesListener: AudioObjectPropertyListenerBlock?
     private var waitingToQuit = false
+    private var sessionSavePanel: NSSavePanel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        session.translationForRetry = { [weak self] in
+            guard let self else { throw CancellationError() }
+            let service = try self.preferences.translation(using: self.translationKey.savedConnection(self.preferences))
+            let approved = UserDefaults.standard.stringArray(forKey: "approvedAPIAddresses")?.last
+            guard service.connection.endpoint.base.absoluteString == approved else {
+                throw AppFailure.api("请开始新的转写并确认新的翻译地址，再向该服务发送字幕。", retryable: false)
+            }
+            return service
+        }
         AppLog.launch(version: AppMetadata.version, build: AppMetadata.build)
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
@@ -259,6 +303,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard session.phase != .idle else { return .terminateNow }
         if !waitingToQuit {
             waitingToQuit = true
+            if let picker = sessionSavePanel { picker.cancel(nil) }
             session.stop()
             Task {
                 while session.phase != .idle { try? await Task.sleep(for: .milliseconds(100)) }
@@ -285,11 +330,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let paused = session.phase == .paused
         menu.addItem(item(paused ? "继续转写" : "暂停转写", #selector(togglePause), enabled: paused || session.phase == .listening))
         menu.addItem(item("停止转写", #selector(stop), enabled: session.phase != .idle && session.phase != .stopping))
+        menu.addItem(item("停止并另存为…", #selector(stopAndSaveAs), enabled: session.canStopAndSaveAs))
         menu.addItem(item("隐藏字幕窗", #selector(hidePanel), enabled: panel?.isVisible == true))
         menu.addItem(item("显示字幕窗", #selector(showPanel)))
         if !session.savedFiles.isEmpty {
             menu.addItem(item("在 Finder 中显示已保存文件", #selector(revealExport)))
         }
+        let folderItem = item("打开保存文件夹", #selector(openExportFolder))
+        folderItem.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+        menu.addItem(folderItem)
         menu.addItem(item("另存本节课文本…", #selector(save), enabled: session.canExport))
         menu.addItem(.separator())
         menu.addItem(selectionMenu("输入源", values: preferences.audioChoices.map { ($0.id, $0.label) },
@@ -345,59 +394,45 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc func begin() {
         guard session.phase == .idle else { return }
-        let translation: TranslationConfiguration
-        do {
-            translation = try preferences.translationModel.configuration(
-                customID: preferences.customTranslationModelID, fast: preferences.fastTranslation
-            )
-        } catch {
-            openSettings()
-            showError(error)
-            return
-        }
         showPanel()
         session.start(
             source: .source(preferences.sourceID), target: .target(preferences.targetID),
-            transcription: preferences.transcriptionModel, translation: translation,
-            audioInputID: preferences.audioInputID, segmentationLength: preferences.segmentationLength
+            audioInputID: preferences.audioInputID, segmentationLength: preferences.segmentationLength,
+            automaticSave: preferences.automaticSave, retentionDays: preferences.retentionDays
         ) { [weak self] in
             try await self?.authorizeStart()
         }
     }
 
-    private func authorizeStart() async throws -> String? {
-        let credential: String?
-        if KeyStore.temporaryKey != nil { AppLog.event("keychain.read.temporary") }
+    private func authorizeStart() async throws -> SessionAPIs? {
+        let apis: SessionAPIs
         do {
-            credential = try await KeyStore.read()
+            let transcription = try preferences.transcription(using: transcriptionKey.savedConnection(preferences))
+            let translation = try preferences.translation(using: translationKey.savedConnection(preferences))
+            apis = SessionAPIs(transcription: transcription, translation: translation)
         } catch {
-            if !Task.isCancelled {
-                openSettings()
-                keySettings.report(error)
-            }
+            openSettings()
             throw error
         }
         try Task.checkCancellation()
-        guard let credential else {
-            openSettings()
-            return nil
-        }
-        if !UserDefaults.standard.bool(forKey: "cloudDisclosureAccepted") {
+        let destinations = [apis.transcription.connection, apis.translation.connection].map { $0.endpoint.base.absoluteString }
+        let defaults = UserDefaults.standard
+        if defaults.stringArray(forKey: "approvedAPIAddresses") != destinations {
             AppLog.event("app.consent.prompt")
-            let accepted = await requestCloudConsent()
+            let accepted = await requestCloudConsent(transcription: destinations[0], translation: destinations[1])
             try Task.checkCancellation()
             AppLog.event(accepted ? "app.consent.accepted" : "app.consent.declined")
             guard accepted else { return nil }
-            UserDefaults.standard.set(true, forKey: "cloudDisclosureAccepted")
+            defaults.set(destinations, forKey: "approvedAPIAddresses")
         }
-        return credential
+        return apis
     }
 
-    private func requestCloudConsent() async -> Bool {
+    private func requestCloudConsent(transcription: String, translation: String) async -> Bool {
         guard let panel else { return false }
         let alert = NSAlert()
-        alert.messageText = "使用音频输入和 OpenAI"
-        alert.informativeText = "开始后，App 会采集所选输入并同步录音，通过你的 API Key 把转写用音频和待译文本发送给 OpenAI。点击停止后，录音和双语字幕会自动保存到你设置的文件夹。"
+        alert.messageText = "使用音频输入和 API"
+        alert.informativeText = "转写用音频将发送至 \(transcription)。待译原文将发送至 \(translation)。点击停止后，录音和双语字幕会自动保存在你设置的文件夹。"
         alert.addButton(withTitle: "同意并开始")
         alert.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
@@ -419,6 +454,35 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func stop() {
         session.stop()
+    }
+
+    @objc private func stopAndSaveAs() {
+        guard session.canStopAndSaveAs else { return }
+        session.stop { [weak self] suggestedName, error in
+            guard let self, !self.waitingToQuit else { return nil }
+            return await self.chooseSessionCopy(suggestedName: suggestedName, error: error)
+        }
+    }
+
+    private func chooseSessionCopy(suggestedName: String, error: String?) async -> SessionExport? {
+        let picker = NSSavePanel()
+        picker.title = "停止并另存为"
+        picker.prompt = "另存"
+        picker.message = error.map { "未能另存，请选择其他文件名或文件夹。\n\($0)" }
+            ?? "录音和字幕将使用同一名称。"
+        picker.canCreateDirectories = true
+        picker.directoryURL = preferences.exportFolder ?? TextExport.automaticFolder
+        picker.nameFieldStringValue = suggestedName
+        showPanel()
+        NSApp.activate(ignoringOtherApps: true)
+        guard let panel else { return nil }
+        sessionSavePanel = picker
+        return await withCheckedContinuation { continuation in
+            picker.beginSheetModal(for: panel) { [weak self] response in
+                self?.sessionSavePanel = nil
+                continuation.resume(returning: response == .OK ? picker.url.map(SessionExport.init(savePanelURL:)) : nil)
+            }
+        }
     }
 
     @objc private func togglePause() {
@@ -462,7 +526,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             begin: { [weak self] in self?.begin() },
             togglePause: { [weak self] in self?.togglePause() },
             stop: { [weak self] in self?.stop() },
-            revealExport: { [weak self] in self?.revealExport() }
+            stopAndSaveAs: { [weak self] in self?.stopAndSaveAs() }
         ))
         panel.center()
         panel.setFrameAutosaveName("ClassroomCaptionFrame")
@@ -509,7 +573,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             window.isReleasedWhenClosed = false
             window.contentView = NSHostingView(rootView: SettingsView(
                 preferences: preferences,
-                keys: keySettings,
+                transcriptionKey: transcriptionKey,
+                translationKey: translationKey,
                 shortcuts: shortcuts,
                 chooseExportFolder: { [weak self] in self?.chooseExportFolder() },
                 revealDiagnostics: { [weak self] in self?.revealDiagnostics() },
@@ -595,6 +660,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func revealExport() {
         NSWorkspace.shared.activateFileViewerSelecting(session.savedFiles)
+    }
+
+    @objc private func openExportFolder() {
+        let folder = preferences.exportFolder ?? TextExport.automaticFolder
+        do {
+            try SessionExport.prepare(folder: folder, createFolder: preferences.exportFolder == nil)
+            guard NSWorkspace.shared.open(folder) else { throw CocoaError(.fileReadUnknown) }
+        } catch {
+            showError(error)
+        }
     }
 
     @objc private func save() {

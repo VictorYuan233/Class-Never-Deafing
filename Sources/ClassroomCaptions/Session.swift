@@ -29,6 +29,7 @@ final class ClassroomSession: ObservableObject {
 
     private struct TranslationJob {
         let id: UUID
+        let service: TranslationService
         let enqueuedAt = ContinuousClock.now
     }
 
@@ -40,8 +41,10 @@ final class ClassroomSession: ObservableObject {
     @Published private(set) var recordingClock = RecordingClock()
     @Published private(set) var automaticExportURL: URL?
     @Published private(set) var automaticRecordingURL: URL?
+    @Published private(set) var manualExportFiles: [URL] = []
     @Published private(set) var hasError = false
     var exportFolder: URL?
+    private var chooseSaveCopy: ((String, String?) async -> SessionExport?)?
 
     private var drafts = TranscriptDrafts()
     private var indices: [UUID: Int] = [:]
@@ -65,10 +68,9 @@ final class ClassroomSession: ObservableObject {
     private var source = Language.automatic
     private var target = Language.simplified
     private var audioInputID = AudioInput.defaultID
-    private var transcriptionModel = TranscriptionModel.live
-    private var translationModel = TranslationConfiguration.defaultModel
+    private var apis: SessionAPIs?
+    var translationForRetry: (() throws -> TranslationService)?
     private var segmentationLength = SegmentationLength.standard
-    private var key: String?
     private var inputChanged = false
     private var resumeSignal: CheckedContinuation<Void, Never>?
     private var silencePauseMinutes: Int?
@@ -79,35 +81,38 @@ final class ClassroomSession: ObservableObject {
         phase == .idle && captions.contains { $0.originalFinal && !$0.original.isEmpty }
     }
 
-    var savedFiles: [URL] { [automaticExportURL, automaticRecordingURL].compactMap { $0 } }
+    var savedFiles: [URL] { manualExportFiles.isEmpty ? [automaticExportURL, automaticRecordingURL].compactMap { $0 } : manualExportFiles }
+    var canStopAndSaveAs: Bool { [.listening, .pausing, .paused, .reconnecting].contains(phase) }
 
     func start(
-        source: Language, target: Language, transcription: TranscriptionModel, translation: TranslationConfiguration,
+        source: Language, target: Language,
         audioInputID: String, segmentationLength: SegmentationLength,
-        authorize: @escaping @MainActor () async throws -> String?
+        automaticSave: Bool, retentionDays: Int,
+        authorize: @escaping @MainActor () async throws -> SessionAPIs?
     ) {
         guard phase == .idle else { return }
         AppLog.event("session.start.requested")
         AppLog.event("session.segmentation", number: segmentationLength.rawValue)
         phase = .authorizing
-        status = "正在读取钥匙串…"
+        status = "正在准备 API 配置…"
         notice = nil
         hasError = false
         self.source = source
         self.target = target
         sessionTask = Task {
             do {
-                let key = try await authorize()
+                let apis = try await authorize()
                 try Task.checkCancellation()
-                guard let key else {
+                guard let apis else {
                     status = "准备就绪"
                     phase = .idle
                     sessionTask = nil
                     return
                 }
-                prepare(transcription: transcription, translation: translation, audioInputID: audioInputID,
-                        segmentationLength: segmentationLength, key: key)
-                await run(recording: SessionRecording())
+                prepare(apis: apis, audioInputID: audioInputID, segmentationLength: segmentationLength)
+                let recording = automaticSave ? SessionRecording() : SessionRecording(
+                    stagingFolder: FileManager.default.temporaryDirectory.appending(path: "Class Never Deafing"))
+                await run(recording: recording, automaticSave: automaticSave, retentionDays: retentionDays)
             } catch {
                 guard !Task.isCancelled else { return }
                 AppLog.failure("session.authorization.failed", error)
@@ -121,8 +126,7 @@ final class ClassroomSession: ObservableObject {
     }
 
     private func prepare(
-        transcription: TranscriptionModel,
-        translation: TranslationConfiguration, audioInputID: String, segmentationLength: SegmentationLength, key: String
+        apis: SessionAPIs, audioInputID: String, segmentationLength: SegmentationLength
     ) {
         cancelTranslations()
         captions.removeAll()
@@ -136,11 +140,11 @@ final class ClassroomSession: ObservableObject {
         recordingClock = RecordingClock()
         automaticExportURL = nil
         automaticRecordingURL = nil
+        manualExportFiles = []
+        chooseSaveCopy = nil
         self.audioInputID = audioInputID
         self.segmentationLength = segmentationLength
-        transcriptionModel = transcription
-        translationModel = translation
-        self.key = key
+        self.apis = apis
         phase = .starting
         status = "正在准备音频输入…"
     }
@@ -148,10 +152,10 @@ final class ClassroomSession: ObservableObject {
     func selectSource(_ language: Language) {
         guard source != language else { return }
         source = language
-        if phase == .listening, let key {
+        if phase == .listening, let api = apis?.transcription, api.selection != .custom {
             cancelRotation()
             let delay: Duration = active?.configuredSource == source ? .seconds(55 * 60) : .zero
-            scheduleRotation(key: key, delay: delay)
+            scheduleRotation(api: api, delay: delay)
         }
     }
 
@@ -218,7 +222,7 @@ final class ClassroomSession: ObservableObject {
         signal?.resume()
     }
 
-    func stop() {
+    func stop(chooseCopy: ((String, String?) async -> SessionExport?)? = nil) {
         guard phase != .idle, phase != .stopping else { return }
         if phase == .authorizing {
             AppLog.event("session.start.cancelled")
@@ -229,6 +233,7 @@ final class ClassroomSession: ObservableObject {
             return
         }
         AppLog.event("session.stop.requested")
+        chooseSaveCopy = chooseCopy
         cancelSilencePause()
         let wasListening = phase == .listening || phase == .pausing
         recordingClock.pause()
@@ -249,36 +254,74 @@ final class ClassroomSession: ObservableObject {
     func retryTranslation(_ id: UUID) {
         guard workers[id] == nil, !translationQueue.contains(where: { $0.id == id }), let index = indices[id],
               captions[index].translationFailed else { return }
-        Task {
-            do {
-                let credential: String?
-                if let key { credential = key } else { credential = try await KeyStore.read() }
-                guard workers[id] == nil, !translationQueue.contains(where: { $0.id == id }), let index = indices[id],
-                      captions[index].translationFailed else { return }
-                guard let credential else {
-                    notice = "请先在设置中保存 OpenAI API Key。"
-                    return
-                }
-                translationQueue.append(TranslationJob(id: id))
-                startQueuedTranslations(using: credential)
-            } catch {
-                if indices[id] != nil { notice = error.localizedDescription }
-            }
+        do {
+            guard let service = try apis?.translation ?? translationForRetry?() else { return }
+            translationQueue.append(TranslationJob(id: id, service: service))
+            startQueuedTranslations()
+        } catch {
+            notice = error.localizedDescription
         }
     }
 
-    private func run(recording: SessionRecording) async {
+    private func run(recording: SessionRecording, automaticSave: Bool, retentionDays: Int) async {
         await listen(recording: recording)
-        let destination = SessionExport(folder: exportFolder ?? TextExport.automaticFolder,
-                                        createFolder: exportFolder == nil, name: recording.name)
-        let audio = await recording.finish(to: destination)
-        automaticRecordingURL = audio.url
+        let stoppedByUser = phase == .stopping
+        let destination = automaticSave ? SessionExport(folder: exportFolder ?? TextExport.automaticFolder,
+                                                        createFolder: exportFolder == nil, name: recording.name) : nil
+        let audio: SessionRecording.Outcome
+        if automaticSave || chooseSaveCopy != nil {
+            audio = await recording.finish(to: destination)
+            if automaticSave { automaticRecordingURL = audio.url }
+        } else {
+            await recording.discard()
+            audio = .init()
+        }
         await drainResults()
-        finishSession(destination: destination, recordingWarning: audio.warning)
+        let text = TextExport.render(captions)
+        var warnings = [audio.warning].compactMap { $0 }
+        if let destination, stoppedByUser, !text.isEmpty {
+            do {
+                automaticExportURL = try TextExport.saveAutomatically(text, to: destination)
+                AppLog.event("export.success")
+            } catch {
+                AppLog.failure("export.failed", error)
+                warnings.append("字幕自动保存失败。可在菜单栏选择「另存本节课文本」。")
+            }
+        }
+        if let chooseSaveCopy, audio.url != nil || !text.isEmpty {
+            let name = recording.name.replacingOccurrences(of: "课堂字幕-", with: "课堂记录-")
+            var failure: String?
+            status = "请选择另存位置…"
+            while let copy = await chooseSaveCopy(name, failure) {
+                status = "正在另存录音和字幕…"
+                do {
+                    manualExportFiles = try await Task.detached(priority: .utility) {
+                        try ExportArchive.saveCopy(text: text, audio: audio.url, to: copy)
+                    }.value
+                    break
+                } catch {
+                    AppLog.failure("export.copy.failed", error)
+                    failure = error.localizedDescription
+                }
+            }
+        }
+        if !automaticSave { await recording.discard() }
+        if let destination, stoppedByUser, retentionDays > 0,
+           automaticExportURL != nil || automaticRecordingURL?.deletingLastPathComponent().standardizedFileURL == destination.folder.standardizedFileURL {
+            do {
+                try await Task.detached(priority: .utility) {
+                    try ExportArchive.removeExpired(in: destination.folder, after: retentionDays)
+                }.value
+            } catch {
+                AppLog.failure("export.retention.failed", error)
+                warnings.append("部分过期记录未能删除。")
+            }
+        }
+        finishSession(stoppedByUser: stoppedByUser, automaticSave: automaticSave, warnings: warnings)
     }
 
     private func listen(recording: SessionRecording) async {
-        guard let key, phase != .stopping else { return }
+        guard let api = apis?.transcription, phase != .stopping else { return }
         var attempts = 0
 
         while phase != .stopping, !Task.isCancelled {
@@ -286,15 +329,17 @@ final class ClassroomSession: ObservableObject {
                 await withCheckedContinuation { resumeSignal = $0 }
                 continue
             }
-            let connection = makeConnection(key)
+            let connection = api.selection == .custom ? nil : makeConnection(api.connection)
             active = connection
             inputChanged = false
             var listeningSince: Date?
             do {
-                status = attempts == 0 ? "正在连接 OpenAI…" : "正在重连（\(attempts)/3）…"
-                AppLog.event("session.connection.begin", number: attempts)
-                try await connection.connect(source: source, model: transcriptionModel)
-                AppLog.event("session.connection.ready")
+                if let connection {
+                    status = attempts == 0 ? "正在连接转写 API…" : "正在重连（\(attempts)/3）…"
+                    AppLog.event("session.connection.begin", number: attempts)
+                    try await connection.connect(source: source, model: api.selection)
+                    AppLog.event("session.connection.ready")
+                }
                 guard phase != .stopping else { break }
                 let input = AudioCapture(inputID: audioInputID, length: segmentationLength, recording: recording)
                 capture = input
@@ -307,9 +352,11 @@ final class ClassroomSession: ObservableObject {
                 listeningSince = Date()
                 status = "正在监听"
                 armSilencePause()
-                let delay: Duration = connection.configuredSource == source ? .seconds(55 * 60) : .zero
-                scheduleRotation(key: key, delay: delay)
-                try await upload(audio, tracking: input)
+                if let connection {
+                    let delay: Duration = connection.configuredSource == source ? .seconds(55 * 60) : .zero
+                    scheduleRotation(api: api, delay: delay)
+                }
+                try await upload(audio, tracking: input, service: api)
                 cancelSilencePause()
                 await input.stopAndDrain()
                 capture = nil
@@ -387,7 +434,7 @@ final class ClassroomSession: ObservableObject {
             if Task.isCancelled { break }
             if phase == .stopping {
                 let pendingRecovery = !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty
-                let message = pendingRecovery ? "正在补识别剩余音频…" : "正在补齐译文…"
+                let message = pendingRecovery ? "正在处理剩余音频…" : "正在补齐译文…"
                 if status != message { status = message }
             }
             try? await Task.sleep(for: .milliseconds(100))
@@ -402,7 +449,7 @@ final class ClassroomSession: ObservableObject {
         status = pausedForSilence ? "无声超时，已自动暂停" : "已暂停"
     }
 
-    private func upload(_ audio: AudioEvents, tracking input: AudioCapture) async throws {
+    private func upload(_ audio: AudioEvents, tracking input: AudioCapture, service: TranscriptionService) async throws {
         let inputID = ObjectIdentifier(input)
         let observer = input.engine.map { engine in
             NotificationCenter.default.addObserver(
@@ -419,6 +466,7 @@ final class ClassroomSession: ObservableObject {
         }
         defer { if let observer { NotificationCenter.default.removeObserver(observer) } }
         var segment: UUID?
+        var segmentSource = source
         var pcm = Data()
         var sentFirstPacket = false
         do {
@@ -426,28 +474,32 @@ final class ClassroomSession: ObservableObject {
                 switch packet.event {
                 case .audio(let data):
                     if segment == nil {
-                        await switchSourceAtBoundary()
-                        let caption = Caption()
+                        if service.selection != .custom { await switchSourceAtBoundary() }
+                        segmentSource = active?.configuredSource ?? source
+                        let caption = Caption(recordingStartSeconds: packet.recordingStartSeconds)
                         indices[caption.id] = captions.count
                         captions.append(caption)
                         segment = caption.id
                     }
-                    guard let active else { return }
-                    if transcriptionModel == .live { pcm.append(data) }
+                    if service.selection != .committed { pcm.append(data) }
                     if !sentFirstPacket {
                         sentFirstPacket = true
                         AppLog.latency("audio.first_packet_queue_ms", since: packet.queuedAt)
                     }
-                    try await active.append(data)
+                    if let active { try await active.append(data) }
                 case .commit(let boundary):
-                    if let id = segment, let active {
+                    if let id = segment {
                         if let index = indices[id] { captions[index].translationLanguage = target }
-                        let audio = pcm.isEmpty ? nil : SegmentAudio(pcm: pcm, source: active.configuredSource ?? source)
+                        let audio = pcm.isEmpty ? nil : SegmentAudio(pcm: pcm, source: segmentSource)
                         rememberSubmission(id, boundary: boundary, audio: audio)
                         pcm = Data()
                         AppLog.event("audio.boundary_pause_ms", number: boundary.silentFrames * 20)
                         AppLog.latency("audio.commit_queue_ms", since: packet.queuedAt)
-                        try await active.commit(id)
+                        if let active {
+                            try await active.commit(id)
+                        } else {
+                            resolveRealtime(id, text: nil)
+                        }
                         segment = nil
                     }
                 }
@@ -460,11 +512,11 @@ final class ClassroomSession: ObservableObject {
     }
 
     private func switchSourceAtBoundary() async {
-        guard phase == .listening, let current = active, let key else { return }
+        guard phase == .listening, let current = active, let api = apis?.transcription else { return }
         if current.configuredSource != source, replacement?.configuredSource != source {
             if rotationSource != source {
                 cancelRotation()
-                scheduleRotation(key: key, delay: .zero)
+                scheduleRotation(api: api, delay: .zero)
             }
             await rotation?.value
         }
@@ -473,11 +525,11 @@ final class ClassroomSession: ObservableObject {
         replacement = nil
         active = next
         retire(current)
-        scheduleRotation(key: key, delay: .seconds(55 * 60))
+        scheduleRotation(api: api, delay: .seconds(55 * 60))
     }
 
-    private func makeConnection(_ credential: String) -> RealtimeConnection {
-        let connection = RealtimeConnection(key: credential) { [weak self] event in
+    private func makeConnection(_ api: APIConnection) -> RealtimeConnection {
+        let connection = RealtimeConnection(api: api) { [weak self] event in
             self?.apply(event)
         } onDisconnect: { [weak self] id, _ in
             guard let self else { return }
@@ -489,8 +541,8 @@ final class ClassroomSession: ObservableObject {
                 self.remove(connection)
                 if wasReplacement {
                     self.replacement = nil
-                    if self.phase == .listening, let key = self.key {
-                        self.scheduleRotation(key: key, delay: .seconds(10))
+                    if self.phase == .listening, let api = self.apis?.transcription {
+                        self.scheduleRotation(api: api, delay: .seconds(10))
                     }
                 }
             }
@@ -499,7 +551,7 @@ final class ClassroomSession: ObservableObject {
         return connection
     }
 
-    private func scheduleRotation(key: String, delay: Duration) {
+    private func scheduleRotation(api: TranscriptionService, delay: Duration) {
         rotation?.cancel()
         let requestedSource = source
         rotationSource = requestedSource
@@ -507,9 +559,9 @@ final class ClassroomSession: ObservableObject {
             do {
                 try await Task.sleep(for: delay)
                 guard phase == .listening else { return }
-                let next = makeConnection(key)
+                let next = makeConnection(api.connection)
                 do {
-                    try await next.connect(source: requestedSource, model: transcriptionModel)
+                    try await next.connect(source: requestedSource, model: api.selection)
                     try Task.checkCancellation()
                     guard phase == .listening else {
                         remove(next)
@@ -522,7 +574,7 @@ final class ClassroomSession: ObservableObject {
                         if active?.configuredSource != source {
                             notice = "源语言暂未切换，将在下一段重试。"
                         }
-                        scheduleRotation(key: key, delay: .seconds(10))
+                        scheduleRotation(api: api, delay: .seconds(10))
                     }
                 }
             } catch { return }
@@ -561,35 +613,25 @@ final class ClassroomSession: ObservableObject {
         active = nil
     }
 
-    private func finishSession(destination: SessionExport, recordingWarning: String?) {
-        let stoppedByUser = phase == .stopping
+    private func finishSession(stoppedByUser: Bool, automaticSave: Bool, warnings: [String]) {
         cancelSilencePause()
         recordingClock.pause()
         closeAll()
         submitted.removeAll()
         stopDeadline?.cancel()
         stopDeadline = nil
-        key = nil
+        apis = nil
+        chooseSaveCopy = nil
         sessionTask = nil
         AppLog.event("session.ended", number: Int(recordingClock.elapsed().components.seconds))
-        var warnings = [recordingWarning].compactMap { $0 }
         if stoppedByUser {
-            let text = TextExport.render(captions)
-            if !text.isEmpty {
-                do {
-                    automaticExportURL = try TextExport.saveAutomatically(text, to: destination)
-                    AppLog.event("export.success")
-                } catch {
-                    AppLog.failure("export.failed", error)
-                    warnings.append("字幕自动保存失败。可在菜单栏选择「另存本节课文本」。")
-                }
-            }
             switch (automaticExportURL, automaticRecordingURL) {
             case (.some, .some): status = "已停止 · 字幕和录音已保存"
             case (.some, nil): status = "已停止 · 字幕已保存"
             case (nil, .some): status = "已停止 · 录音已保存"
-            case (nil, nil): status = "已停止 · 没有可保存的内容"
+            case (nil, nil): status = automaticSave ? "已停止 · 没有可保存的内容" : "已停止 · 自动保存已关闭"
             }
+            if !manualExportFiles.isEmpty { status = "已停止 · 已另存" }
         }
         if !warnings.isEmpty {
             hasError = true
@@ -638,18 +680,25 @@ final class ClassroomSession: ObservableObject {
             return
         }
 
-        let omitIfEmpty = text != nil && segment?.boundary.hasSustainedSignal == false
-        if text != nil {
+        let service = apis?.transcription
+        let usesHTTP = service?.selection == .custom
+        let omitIfEmpty = (text != nil || usesHTTP) && segment?.boundary.hasSustainedSignal == false
+        if usesHTTP {
+            AppLog.event("transcription.segment.submitted")
+        } else if text != nil {
             AppLog.event("transcription.empty", number: segment.map { $0.boundary.voicedFrames * 20 })
         } else {
             AppLog.event("transcription.failed")
         }
-        if let audio = segment?.audio, let key, recoveryQueue.count + recoveryWorkers.count < 12 {
+        if let audio = segment?.audio, let service, recoveryQueue.count + recoveryWorkers.count < 12 {
             if !partial.isEmpty { captions[index].original = partial }
             recoveryQueue.append(Recovery(id: id, audio: audio, partial: partial, omitIfEmpty: omitIfEmpty))
-            startQueuedRecovery(using: key)
+            startQueuedRecovery(using: service)
         } else {
-            if segment?.audio != nil { AppLog.event("transcription.recovery.skipped") }
+            if segment?.audio != nil {
+                AppLog.event("transcription.recovery.skipped")
+                if usesHTTP { notice = "转写 API 处理跟不上，部分音频未能转写。录音仍会保存。" }
+            }
             finishOriginal(partial, for: id, omitIfEmpty: omitIfEmpty)
         }
     }
@@ -667,24 +716,28 @@ final class ClassroomSession: ObservableObject {
         submitted[id] = SubmittedSegment(boundary: boundary, audio: audio)
     }
 
-    private func startQueuedRecovery(using credential: String) {
+    private func startQueuedRecovery(using service: TranscriptionService) {
+        let usesHTTP = service.selection == .custom
+        let model = usesHTTP ? service.modelID : TranscriptionModel.committed.rawValue
         while recoveryWorkers.count < 2, !recoveryQueue.isEmpty {
             let job = recoveryQueue.removeFirst()
             recoveryWorkers[job.id] = Task {
                 var original = job.partial
                 var omitIfEmpty = job.omitIfEmpty
                 do {
-                    let recovered = try await TranscriptionRecoveryAPI.transcribe(job.audio.pcm, source: job.audio.source, key: credential)
+                    let recovered = try await TranscriptionRecoveryAPI.transcribe(job.audio.pcm, source: job.audio.source,
+                                                                                   api: service.connection, model: model)
                         .trimmingCharacters(in: .whitespacesAndNewlines)
                     AppLog.event(recovered.isEmpty ? "transcription.recovery.empty" : "transcription.recovery.success")
                     if !recovered.isEmpty { original = recovered }
                 } catch {
                     omitIfEmpty = false
                     AppLog.failure("transcription.recovery.failed", error)
+                    if usesHTTP { notice = description(for: error) }
                 }
                 finishOriginal(original, for: job.id, omitIfEmpty: omitIfEmpty)
                 recoveryWorkers.removeValue(forKey: job.id)
-                startQueuedRecovery(using: credential)
+                startQueuedRecovery(using: service)
             }
         }
     }
@@ -697,9 +750,9 @@ final class ClassroomSession: ObservableObject {
         caption.originalFailed = text.isEmpty && !omitIfEmpty
         captions[index] = caption
         if text.isEmpty && omitIfEmpty { AppLog.event("transcription.empty.low_signal") }
-        if !text.isEmpty, let key {
-            translationQueue.append(TranslationJob(id: id))
-            startQueuedTranslations(using: key)
+        if !text.isEmpty, let service = apis?.translation {
+            translationQueue.append(TranslationJob(id: id, service: service))
+            startQueuedTranslations()
         }
     }
 
@@ -738,7 +791,7 @@ final class ClassroomSession: ObservableObject {
         captions = updated
     }
 
-    private func startQueuedTranslations(using credential: String) {
+    private func startQueuedTranslations() {
         while workers.count < 4, !translationQueue.isEmpty {
             let job = translationQueue.removeFirst()
             let id = job.id
@@ -746,7 +799,6 @@ final class ClassroomSession: ObservableObject {
             let original = captions[index].original
             let previous = captions[..<index].last { $0.originalFinal && !$0.original.isEmpty }?.original
             let language = captions[index].translationLanguage
-            let model = translationModel
             if captions[index].translationFailed {
                 captions[index].translation = ""
                 captions[index].translationFailed = false
@@ -755,12 +807,12 @@ final class ClassroomSession: ObservableObject {
                 defer {
                     if !Task.isCancelled {
                         workers.removeValue(forKey: id)
-                        startQueuedTranslations(using: credential)
+                        startQueuedTranslations()
                     }
                 }
                 do {
                     AppLog.latency("translation.queue_ms", since: job.enqueuedAt)
-                    let text = try await TranslationAPI.shared.translate(original, to: language, model: model, previous: previous, key: credential) { delta in
+                    let text = try await TranslationAPI.shared.translate(original, to: language, service: job.service, previous: previous) { delta in
                         if !Task.isCancelled, self.indices[id] != nil {
                             self.translationDeltas[id, default: ""] += delta
                             self.scheduleTranslationRefresh()
@@ -804,6 +856,7 @@ final class ClassroomSession: ObservableObject {
 
     private func description(for error: Error) -> String {
         if let failure = error as? AppFailure { return failure.localizedDescription }
-        return "无法连接 OpenAI，请检查网络后重试。"
+        if let failure = error as? APISettingError { return failure.localizedDescription }
+        return "API 请求失败 · \(error.localizedDescription)"
     }
 }

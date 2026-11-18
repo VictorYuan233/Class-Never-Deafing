@@ -3,11 +3,12 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>0.7.0</string>
+    <string>0.10.1</string>
     <key>highlights</key>
     <array>
-        <string>转写时自动录下所选输入源。暂停会停止录音，继续时接着录同一场。</string>
-        <string>停止后自动保存 WAV 录音和同名双语字幕，可从字幕窗打开 Finder 定位文件。</string>
+        <string>调整设置顺序，转写和翻译 API 位于字体和快捷键之间。</string>
+        <string>功能说明改为悬停提示，翻译接口提示包含 Responses 与 Chat Completions 的区别。</string>
+        <string>移除字幕窗停止后出现的文件夹按钮，设置底部的「详情」更名为「关于」。</string>
     </array>
 </dict>
 </plist>

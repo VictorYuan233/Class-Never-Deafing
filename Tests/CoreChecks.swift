@@ -9,8 +9,7 @@ struct CoreChecks {
         try checkCaptionShortcuts()
         try checkTranslationConfiguration()
         try checkSubtitleColors()
-        await checkTemporaryCredential()
-        try await checkKeychainTimeout()
+        try checkAPISettings()
         try checkLogRetention()
         checkSpeechBoundaries()
         checkQuietMicrophone()
@@ -26,8 +25,9 @@ struct CoreChecks {
         checkCaptionScroll()
         checkRecordingClock()
         try checkExport()
+        try checkExportArchive()
         try await checkSessionRecording()
-        print("通过：语言、字幕窗快捷键、自定义模型参数、字体颜色、临时 Key、钥匙串后台超时、日志容量和淘汰、轻声检测、可调分句、Fast 翻译与补识别请求、系统音频格式转换与分包、多段实时原文、失败提示合并、字幕滚动、静音检测与暂停计时、字幕录音配对保存。")
+        print("通过：独立 API 地址与密钥、密钥加密和错误脱敏、翻译与转写请求、字幕窗快捷键、诊断日志、音频分段、字幕录音配对保存。")
     }
 
     private static func checkTranscriptDrafts() {
@@ -84,46 +84,42 @@ struct CoreChecks {
         precondition(activity.lastHeardAt == start.advanced(by: .milliseconds(120)))
     }
 
-    @MainActor private static func checkTemporaryCredential() async {
-        precondition(KeyStore.temporaryKey == nil)
-        KeyStore.useUntilQuit("offline-test-placeholder")
-        let activeKey = try? await KeyStore.read()
-        precondition(activeKey == "offline-test-placeholder")
-        KeyStore.useUntilQuit("replacement-placeholder")
-        let replacement = try? await KeyStore.read()
-        precondition(replacement == "replacement-placeholder")
-        KeyStore.clearTemporaryKey()
-        precondition(KeyStore.temporaryKey == nil)
-    }
-
-    @MainActor private static func checkKeychainTimeout() async throws {
-        let worker = KeychainWorker()
-        let release = DispatchSemaphore(value: 0)
-        defer { release.signal() }
-        do {
-            _ = try await worker.perform(timeout: .milliseconds(50)) {
-                precondition(!Thread.isMainThread)
-                release.wait()
-                return "late result"
-            }
-            preconditionFailure("A stalled read should time out")
-        } catch AppFailure.keychainTimeout {}
-        do {
-            _ = try await worker.perform { "overlapping read" }
-            preconditionFailure("A timed-out underlying operation must not allow overlapping requests")
-        } catch AppFailure.keychainBusy {}
-
-        release.signal()
-        for _ in 0..<50 {
-            do {
-                let value = try await worker.perform { "available again" }
-                precondition(value == "available again")
-                return
-            } catch AppFailure.keychainBusy {
-                try await Task.sleep(for: .milliseconds(10))
-            }
-        }
-        preconditionFailure("The worker did not recover after the system call returned")
+    private static func checkAPISettings() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let store = APIKeyStore(folder: folder)
+        let transcription = try APIEndpoint("https://speech.example/v1/")
+        let translation = try APIEndpoint("https://text.example/v2")
+        let speechKey = "test-speech-credential"
+        let textKey = "test-text-credential"
+        try store.save(speechKey, role: .transcription, endpoint: transcription)
+        try store.save(textKey, role: .translation, endpoint: translation)
+        let speech = try store.connection(.transcription, endpoint: transcription)
+        let text = try store.connection(.translation, endpoint: translation)
+        precondition(speech.key == speechKey && text.key == textKey)
+        precondition(transcription.realtimeURL.absoluteString == "wss://speech.example/v1/realtime?intent=transcription")
+        precondition((try? store.connection(.transcription, endpoint: translation)) == nil)
+        precondition((try? APIEndpoint("http://speech.example/v1")) == nil)
+        precondition((try? APIEndpoint("https://user@speech.example/v1")) == nil)
+        precondition((try? APIConnection.validateKey("line\nbreak")) == nil)
+        let encrypted = try Data(contentsOf: folder.appending(path: "transcription.sealed"))
+        precondition(encrypted.range(of: Data(speechKey.utf8)) == nil)
+        let mode = try FileManager.default.attributesOfItem(atPath: folder.appending(path: "local.key").path)[.posixPermissions] as? Int
+        precondition(mode == 0o600)
+        try store.delete(.transcription)
+        let deleted = try store.load(.transcription)
+        let retained = try store.load(.translation)
+        precondition(deleted == nil && retained?.key == textKey)
+        let failureBody = Data(#"{"error":{"code":"invalid_api_key","message":"Rejected test-text-credential"}}"#.utf8)
+        let failure = APIResponseError.describe(failureBody, status: 401, key: textKey).localizedDescription
+        precondition(failure.contains("HTTP 401") && failure.contains("invalid_api_key") && failure.contains("Rejected"))
+        precondition(!failure.contains(textKey))
+        let body = try TranslationAPI.requestBody("Hello", to: .simplified, model: TranslationModel.custom.configuration(customID: "third-party", fast: true), previous: nil, format: .chat)
+        let chat = try JSONSerialization.jsonObject(with: body) as! [String: Any]
+        precondition(chat["model"] as? String == "third-party" && chat["service_tier"] as? String == "fast")
+        precondition((chat["messages"] as? [[String: String]])?.last?["content"]?.contains("Hello") == true)
+        let selected = try TranscriptionModel.custom.modelID(customID: " whisper-1 ")
+        precondition(selected == "whisper-1")
     }
 
     private static func checkLogRetention() throws {
@@ -345,8 +341,10 @@ struct CoreChecks {
 
     private static func checkTranscriptionRecoveryRequest() {
         let pcm = Data([0x12, 0x34, 0x56, 0x78])
-        let request = TranscriptionRecoveryAPI.request(pcm, source: .english, key: "offline")
+        let api = APIConnection(endpoint: try! APIEndpoint("https://speech.example/v1"), key: "offline")
+        let request = TranscriptionRecoveryAPI.request(pcm, source: .english, api: api)
         precondition(request.httpMethod == "POST" && request.url?.path == "/v1/audio/transcriptions")
+        precondition(request.url?.host == "speech.example" && request.value(forHTTPHeaderField: "Authorization") == "Bearer offline")
         let body = request.httpBody!
         let fields = String(decoding: body, as: UTF8.self)
         precondition(fields.contains("name=\"model\"\r\n\r\ngpt-transcribe"))
@@ -354,8 +352,9 @@ struct CoreChecks {
         let riff = body.range(of: Data("RIFF".utf8))!.lowerBound
         precondition(body.subdata(in: (riff + 24)..<(riff + 28)) == Data([0xc0, 0x5d, 0, 0]))
         precondition(body.subdata(in: (riff + 40)..<(riff + 48)) == Data([4, 0, 0, 0]) + pcm)
-        let autoBody = TranscriptionRecoveryAPI.request(pcm, source: .automatic, key: "offline").httpBody!
+        let autoBody = TranscriptionRecoveryAPI.request(pcm, source: .automatic, api: api, model: "whisper-1").httpBody!
         precondition(!String(decoding: autoBody, as: UTF8.self).contains("name=\"language\""))
+        precondition(String(decoding: autoBody, as: UTF8.self).contains("whisper-1"))
     }
 
     private static func checkSpeechEvidence() {
@@ -449,12 +448,12 @@ struct CoreChecks {
 
     private static func checkExport() throws {
         let results = [
-            Caption(original: "First\nline", translation: "第一段", originalFinal: true, translationFinal: true),
-            Caption(original: "Second", translation: "断开的草稿", originalFinal: true),
+            Caption(recordingStartSeconds: 0, original: "First\nline", translation: "第一段", originalFinal: true, translationFinal: true),
+            Caption(recordingStartSeconds: 3661, original: "Second", translation: "断开的草稿", originalFinal: true),
             Caption(original: "Unfinished raw transcript", translation: ""),
         ]
         let exported = TextExport.render(results)
-        precondition(exported == "First line\n第一段\n\nSecond\n[翻译未完成]\n")
+        precondition(exported == "[00:00:00] First line\n第一段\n\n[01:01:01] Second\n[翻译未完成]\n")
         precondition(String(data: Data(exported.utf8), encoding: .utf8) == exported)
         precondition(TextExport.render([]).isEmpty)
 
@@ -472,45 +471,113 @@ struct CoreChecks {
         precondition(write == nil && !FileManager.default.fileExists(atPath: unavailable.path))
     }
 
+    private static func checkExportArchive() throws {
+        let fm = FileManager.default
+        let folder = fm.temporaryDirectory.appending(path: UUID().uuidString)
+        try fm.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? fm.removeItem(at: folder) }
+        let old = SessionExport(folder: folder, createFolder: false, name: SessionExport.name())
+        let recent = SessionExport(folder: folder, createFolder: false, name: SessionExport.name())
+        let now = Date()
+        let expired = now.addingTimeInterval(-2 * 86_400)
+        for record in [old, recent] {
+            for ext in ["mp3", "txt"] {
+                let file = record.fileURL(endingIn: ext)
+                try "test".write(to: file, atomically: true, encoding: .utf8)
+                let date = record.name == recent.name && ext == "mp3" ? now : expired
+                try fm.setAttributes([.modificationDate: date], ofItemAtPath: file.path)
+            }
+        }
+        let copyName = folder.appending(path: "我的课堂.txt")
+        let copy = SessionExport(savePanelURL: copyName)
+        precondition(copy.name == "我的课堂")
+        let copied = try ExportArchive.saveCopy(text: "字幕", audio: old.fileURL(endingIn: "mp3"), to: copy)
+        precondition(Set(copied) == Set([copyName, folder.appending(path: "我的课堂.mp3")]))
+        let collision = try? ExportArchive.saveCopy(text: "新字幕", audio: nil, to: copy)
+        let original = try String(contentsOf: copyName, encoding: .utf8)
+        precondition(collision == nil && original == "字幕")
+        for file in copied { try fm.setAttributes([.modificationDate: expired], ofItemAtPath: file.path) }
+        try ExportArchive.removeExpired(in: folder, after: 0, now: now)
+        precondition(fm.fileExists(atPath: old.fileURL(endingIn: "mp3").path))
+        try ExportArchive.removeExpired(in: folder, after: 1, now: now)
+        for ext in ["mp3", "txt"] {
+            precondition(!fm.fileExists(atPath: old.fileURL(endingIn: ext).path))
+            precondition(fm.fileExists(atPath: recent.fileURL(endingIn: ext).path))
+            precondition(fm.fileExists(atPath: copy.fileURL(endingIn: ext).path))
+        }
+    }
+
     private static func checkSessionRecording() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: root) }
         let staging = root.appendingPathComponent("staging")
         let folder = root.appendingPathComponent("output")
-        let recording = SessionRecording(stagingFolder: staging)
+        let encoder = URL(fileURLWithPath: CommandLine.arguments[1])
+        let recording = SessionRecording(stagingFolder: staging, encoder: encoder)
         let destination = SessionExport(folder: folder, createFolder: true, name: recording.name)
         let format = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)!
 
-        func capture(_ sample: Int16, using recording: SessionRecording) async throws -> Int {
+        func capture(_ sample: Int16, frames: AVAudioFrameCount = 9_600,
+                     using recording: SessionRecording) async throws -> [QueuedAudioEvent] {
             let processor = AudioProcessor(recording: recording)
-            let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 9_600)!
-            pcm.frameLength = 9_600
+            let pcm = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames)!
+            pcm.frameLength = frames
             let samples = pcm.int16ChannelData![0]
             for index in 0..<Int(pcm.frameLength) { samples[index] = index % 20 < 10 ? sample : -sample }
             processor.copyFromTap(pcm)
             processor.finish()
-            var packets = 0
-            for try await _ in processor.events { packets += 1 }
+            var packets: [QueuedAudioEvent] = []
+            for try await packet in processor.events { packets.append(packet) }
             return packets
         }
 
         // Two captures model pause and resume. The recording includes audio before the speech gate.
-        let silentPackets = try await capture(0, using: recording)
+        let silentPackets = try await capture(0, frames: 28_800, using: recording)
         let speechPackets = try await capture(1200, using: recording)
-        precondition(silentPackets == 0 && speechPackets > 0)
+        precondition(silentPackets.isEmpty)
+        precondition(speechPackets.compactMap(\.recordingStartSeconds) == [1])
         let outcome = await recording.finish(to: destination)
         guard let url = outcome.url, outcome.warning == nil else { preconditionFailure("Recording did not save") }
-        let text = try TextExport.saveAutomatically("Hello.\n你好。\n", to: destination)
-        precondition(url.pathExtension == "wav" && url.deletingPathExtension() == text.deletingPathExtension())
+        let caption = Caption(recordingStartSeconds: speechPackets.first?.recordingStartSeconds,
+                              original: "Hello.", translation: "你好。", originalFinal: true, translationFinal: true)
+        let content = TextExport.render([caption])
+        precondition(content == "[00:00:01] Hello.\n你好。\n")
+        let text = try TextExport.saveAutomatically(content, to: destination)
+        precondition(url.pathExtension == "mp3" && url.deletingPathExtension() == text.deletingPathExtension())
         let recorded = try AVAudioFile(forReading: url)
-        precondition(abs(Double(recorded.length) / recorded.fileFormat.sampleRate - 0.8) < 0.1)
+        precondition(recorded.fileFormat.streamDescription.pointee.mFormatID == kAudioFormatMPEGLayer3)
+        precondition(abs(Double(recorded.length) / recorded.fileFormat.sampleRate - 1.6) < 0.1)
 
-        let recovery = SessionRecording(stagingFolder: staging)
+        let recovery = SessionRecording(stagingFolder: staging, encoder: encoder)
         _ = try await capture(1200, using: recovery)
         let fallback = await recovery.finish(to: .init(folder: root.appendingPathComponent("missing"),
                                                        createFolder: false, name: recovery.name))
+        precondition(fallback.url?.pathExtension == "mp3")
         precondition(fallback.url?.deletingLastPathComponent().path == staging.path && fallback.warning != nil)
         let retained = try AVAudioFile(forReading: fallback.url!)
         precondition(retained.length > 0)
+
+        let missingEncoder = SessionRecording(stagingFolder: staging, encoder: nil)
+        _ = try await capture(1200, using: missingEncoder)
+        let wav = await missingEncoder.finish(to: .init(folder: folder, createFolder: false, name: missingEncoder.name))
+        precondition(wav.url?.pathExtension == "wav" && wav.warning?.contains("MP3 编码失败") == true)
+        let backup = try AVAudioFile(forReading: wav.url!)
+        precondition(backup.length > 0)
+
+        let skipped = SessionRecording(stagingFolder: staging, encoder: encoder)
+        _ = try await capture(1200, using: skipped)
+        await skipped.discard()
+        let discarded = try FileManager.default.contentsOfDirectory(atPath: staging.path)
+        precondition(!discarded.contains { $0.hasPrefix(skipped.name) })
+
+        let manual = SessionRecording(stagingFolder: staging, encoder: encoder)
+        _ = try await capture(1200, using: manual)
+        let staged = await manual.finish(to: nil)
+        guard let audio = staged.url else { preconditionFailure("Expected a staged manual recording") }
+        let manualFiles = try ExportArchive.saveCopy(text: content, audio: audio,
+                                                      to: .init(folder: folder, createFolder: false, name: "手动另存"))
+        await manual.discard()
+        precondition(!FileManager.default.fileExists(atPath: audio.path) && manualFiles.count == 2)
+        precondition(manualFiles.allSatisfy { FileManager.default.fileExists(atPath: $0.path) })
     }
 }

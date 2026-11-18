@@ -37,6 +37,7 @@ struct SoundActivity {
 struct QueuedAudioEvent {
     let event: AudioEvent
     let queuedAt: ContinuousClock.Instant
+    var recordingStartSeconds: Int64? = nil
 }
 
 struct AudioPacketBatcher {
@@ -45,12 +46,13 @@ struct AudioPacketBatcher {
     private var buffered = Data()
     private var bufferedAt: ContinuousClock.Instant?
 
-    mutating func append(_ event: AudioEvent, now: ContinuousClock.Instant) -> [QueuedAudioEvent] {
+    mutating func append(_ event: AudioEvent, now: ContinuousClock.Instant,
+                         recordingStartSeconds: Int64? = nil) -> [QueuedAudioEvent] {
         switch event {
         case .audio(let data):
             if isFirstPacket {
                 isFirstPacket = false
-                return [QueuedAudioEvent(event: .audio(data), queuedAt: now)]
+                return [QueuedAudioEvent(event: .audio(data), queuedAt: now, recordingStartSeconds: recordingStartSeconds)]
             }
             if buffered.isEmpty { bufferedAt = now }
             buffered.append(data)
@@ -85,6 +87,7 @@ struct SpeechSegmenter {
         }
     }
 
+    static let sampleRate = 24_000
     static let samplesPerFrame = 480
     static let bytesPerFrame = samplesPerFrame * 2
     private var preRoll: [Data] = []
@@ -96,6 +99,8 @@ struct SpeechSegmenter {
     private var activeFrames = 0
     private var silentFrames = 0
     private var continuing = false
+    private var processedFrames: Int64 = 0
+    private(set) var speechStartSample: Int64 = 0
     private(set) var lastRMS = 0.0
     private(set) var lastThreshold = 0.0
 
@@ -106,6 +111,7 @@ struct SpeechSegmenter {
     }
 
     mutating func ingest(_ frame: Data) -> [AudioEvent] {
+        processedFrames += 1
         let level = frame.withUnsafeBytes { bytes in
             let samples = bytes.bindMemory(to: Int16.self)
             let squared = samples.reduce(0.0) { sum, sample in
@@ -128,6 +134,7 @@ struct SpeechSegmenter {
                 noiseFloor = noiseFloor * 0.98 + level * 0.02
             }
             guard voicedFrames >= (continuing ? 1 : 2) else { return [] }
+            speechStartSample = (processedFrames - Int64(voicedFrames)) * Int64(Self.samplesPerFrame)
             activeFrames = preRoll.count
             turnVoicedFrames = voicedFrames
             silentFrames = 0
@@ -378,12 +385,14 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     private let slots = DispatchSemaphore(value: 24)
     // Keep roughly the former queue duration with 80 ms packets.
     private let stream = AudioEvents.makeStream(bufferingPolicy: .bufferingOldest(210))
-    private let output = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 24_000, channels: 1, interleaved: true)!
+    private let output = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(SpeechSegmenter.sampleRate),
+                                       channels: 1, interleaved: true)!
     private let recording: SessionRecording?
     private var converter: AVAudioConverter?
     private var segmenter: SpeechSegmenter
     private var packetBatcher = AudioPacketBatcher()
     private var remainder = Data()
+    private var recordingStartSample: Int64?
     private var finished = false
     private var signalFrames = 0
     private var signalPeak = 0.0
@@ -486,7 +495,9 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         guard let samples = buffer.int16ChannelData?.pointee, buffer.frameLength > 0 else { return }
-        recording?.append(buffer)
+        if let offset = recording?.append(buffer), recordingStartSample == nil {
+            recordingStartSample = offset
+        }
         remainder.append(Data(bytes: samples, count: Int(buffer.frameLength) * 2))
         while remainder.count >= SpeechSegmenter.bytesPerFrame {
             let frame = Data(remainder.prefix(SpeechSegmenter.bytesPerFrame))
@@ -513,8 +524,9 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
     private func emit(_ events: [AudioEvent]) {
         guard !events.isEmpty else { return }
         let now = ContinuousClock.now
+        let startSeconds = recordingStartSample.map { ($0 + segmenter.speechStartSample) / Int64(SpeechSegmenter.sampleRate) }
         for event in events {
-            for packet in packetBatcher.append(event, now: now) {
+            for packet in packetBatcher.append(event, now: now, recordingStartSeconds: startSeconds) {
                 if case .dropped = stream.continuation.yield(packet) {
                     AppLog.event("audio.upload.overload")
                     stream.continuation.finish(throwing: AppFailure.audioOverload)
