@@ -3,13 +3,12 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.0.0</string>
+    <string>1.0.1</string>
     <key>highlights</key>
     <array>
-        <string>换上浅薰衣草双气泡应用图标。</string>
-        <string>在设置控件上停留约一秒即可查看操作说明。</string>
-        <string>转写下拉菜单只显示模型名称，三个 API 下拉菜单标注默认选项。</string>
-        <string>从 Spotlight 重新打开已运行的 App 时，显示字幕窗。</string>
+        <string>通过 Core Audio 直接采集系统声音，只需要系统音频权限。</string>
+        <string>缩短「标准」分句的停顿等待，译文可更早开始生成。</string>
+        <string>设置悬停提示缩短到 0.5 秒，浅薰衣草图标的底色铺到边缘。</string>
     </array>
 </dict>
 </plist>

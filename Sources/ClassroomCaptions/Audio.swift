@@ -2,9 +2,7 @@ import AVFoundation
 import Foundation
 import AudioToolbox
 import CoreAudio
-import CoreMedia
 import os
-import ScreenCaptureKit
 
 enum AudioEvent {
     case audio(Data)
@@ -261,8 +259,8 @@ final class AudioCapture {
     private let inputID: String
     private let processor: AudioProcessor
     private(set) var engine: AVAudioEngine?
-    private var screenStream: SCStream?
-    private var screenStarting = false
+    private var systemAudioStop: (() async -> Void)?
+    private var systemAudioShutdown: Task<Void, Never>?
     private var stopped = false
     var lastHeardAt: SuspendingClock.Instant? { processor.lastHeardAt }
 
@@ -297,12 +295,20 @@ final class AudioCapture {
             engine.stop()
             self.engine = nil
         }
-        if !screenStarting { stopSystemAudio() }
+        if let systemAudioStop {
+            self.systemAudioStop = nil
+            systemAudioShutdown = Task {
+                await systemAudioStop()
+                processor.finish()
+            }
+            return
+        }
         processor.finish()
     }
 
     func stopAndDrain() async {
         stop()
+        await systemAudioShutdown?.value
         await withCheckedContinuation { continuation in
             processor.queue.async { continuation.resume() }
         }
@@ -337,50 +343,18 @@ final class AudioCapture {
     }
 
     private func startSystemAudio() async throws {
-        do {
-            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-            guard !stopped else { throw CancellationError() }
-            guard let display = content.displays.first(where: { $0.displayID == CGMainDisplayID() }) ?? content.displays.first else {
-                throw AppFailure.systemAudio
-            }
-            let configuration = SCStreamConfiguration()
-            configuration.capturesAudio = true
-            configuration.excludesCurrentProcessAudio = true
-            configuration.sampleRate = 48_000
-            configuration.channelCount = 1
-            configuration.width = 32
-            configuration.height = 32
-            configuration.minimumFrameInterval = CMTime(value: 1, timescale: 1)
-            let stream = SCStream(filter: SCContentFilter(display: display, excludingWindows: []),
-                                  configuration: configuration, delegate: processor)
-            try stream.addStreamOutput(processor, type: .audio, sampleHandlerQueue: processor.queue)
-            screenStream = stream
-            screenStarting = true
-            defer {
-                screenStarting = false
-                if stopped { stopSystemAudio() }
-            }
-            try await stream.startCapture()
-        } catch {
-            if stopped || error is CancellationError { throw CancellationError() }
-            stopSystemAudio()
-            if !CGPreflightScreenCaptureAccess() { throw AppFailure.systemAudioDenied }
-            throw AppFailure.systemAudio
+        guard #available(macOS 14.2, *) else { throw AppFailure.systemAudioRequiresUpdate }
+        let tap = SystemAudioTap(processor: processor)
+        try await tap.start()
+        guard !stopped else {
+            await tap.stopAndWait()
+            throw CancellationError()
         }
-    }
-
-    private func stopSystemAudio() {
-        guard let screenStream else { return }
-        self.screenStream = nil
-        let processor = processor
-        Task {
-            try? screenStream.removeStreamOutput(processor, type: .audio)
-            try? await screenStream.stopCapture()
-        }
+        systemAudioStop = { await tap.stopAndWait() }
     }
 }
 
-final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
+final class AudioProcessor: @unchecked Sendable {
     let queue = DispatchQueue(label: "classroom-captions.audio", qos: .userInitiated)
     private let slots = DispatchSemaphore(value: 24)
     // Keep roughly the former queue duration with 80 ms packets.
@@ -403,7 +377,6 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
          recording: SessionRecording? = nil) {
         segmenter = SpeechSegmenter(sensitivity: sensitivity, length: length)
         self.recording = recording
-        super.init()
     }
 
     var events: AudioEvents { stream.stream }
@@ -434,29 +407,14 @@ final class AudioProcessor: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    func stream(_ stream: SCStream, didOutputSampleBuffer sample: CMSampleBuffer, of type: SCStreamOutputType) {
-        if type == .audio { ingestSystemSample(sample) }
+    func ingestSystemAudio(_ input: UnsafePointer<AudioBufferList>, format: AVAudioFormat) {
+        guard input.pointee.mNumberBuffers == 1,
+              input.pointee.mBuffers.mDataByteSize > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, bufferListNoCopy: input) else { return }
+        copyFromTap(buffer)
     }
 
-    func ingestSystemSample(_ sample: CMSampleBuffer) {
-        dispatchPrecondition(condition: .onQueue(queue))
-        guard !finished, sample.isValid, sample.numSamples > 0, let description = sample.formatDescription else { return }
-        let format = AVAudioFormat(cmAudioFormatDescription: description)
-        let frames = AVAudioFrameCount(sample.numSamples)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames) else {
-            end(throwing: AppFailure.systemAudio)
-            return
-        }
-        buffer.frameLength = frames
-        guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sample, at: 0, frameCount: Int32(frames),
-                                                           into: buffer.mutableAudioBufferList) == noErr else {
-            end(throwing: AppFailure.systemAudio)
-            return
-        }
-        convert(buffer)
-    }
-
-    func stream(_ stream: SCStream, didStopWithError error: any Error) {
+    func systemAudioInterrupted() {
         queue.async { self.end(throwing: AppFailure.systemAudioInterrupted) }
     }
 

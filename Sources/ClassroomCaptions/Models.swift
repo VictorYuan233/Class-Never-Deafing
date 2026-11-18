@@ -140,7 +140,7 @@ enum SegmentationLength: Int, CaseIterable {
     var limits: Limits {
         switch self {
         case .short: .init(pauseFrames: 30, longTurnPauseFrames: 16, longTurnFrames: 260, maximumFrames: 400)
-        case .standard: .init(pauseFrames: 42, longTurnPauseFrames: 22, longTurnFrames: 400, maximumFrames: 600)
+        case .standard: .init(pauseFrames: 36, longTurnPauseFrames: 20, longTurnFrames: 400, maximumFrames: 600)
         case .longer: .init(pauseFrames: 55, longTurnPauseFrames: 28, longTurnFrames: 520, maximumFrames: 800)
         case .long: .init(pauseFrames: 70, longTurnPauseFrames: 34, longTurnFrames: 720, maximumFrames: 1100)
         case .extended: .init(pauseFrames: 75, longTurnPauseFrames: 75, longTurnFrames: 1500, maximumFrames: 1500)
@@ -464,7 +464,7 @@ enum AppFailure: LocalizedError {
     case microphone
     case microphoneDenied
     case inputUnavailable
-    case systemAudio, systemAudioDenied, systemAudioInterrupted, audioFormat
+    case systemAudio, systemAudioDenied, systemAudioInterrupted, systemAudioRequiresUpdate, audioFormat
     case audioOverload
     case timeout
     case modelName
@@ -476,8 +476,9 @@ enum AppFailure: LocalizedError {
         case .microphoneDenied: "请在系统设置「隐私与安全性 → 麦克风」中允许 Class Never Deafing 访问。"
         case .inputUnavailable: "所选麦克风不可用。请重新连接设备，或在设置中选择其他麦克风。"
         case .systemAudio: "无法采集系统声音，请停止后重试。"
-        case .systemAudioDenied: "请在系统设置「隐私与安全性 → 屏幕与系统音频录制」中允许 Class Never Deafing 访问，必要时退出后重开 App。"
+        case .systemAudioDenied: "请在「隐私与安全性 → 屏幕与系统音频录制」中允许 Class Never Deafing 仅录制系统音频，再重试。"
         case .systemAudioInterrupted: "系统声音采集已中断。"
+        case .systemAudioRequiresUpdate: "采集系统声音需要 macOS 14.2 或更高版本。当前可选择麦克风。"
         case .audioFormat: "无法转换所选输入设备的音频格式。"
         case .audioOverload: "音频处理或网络发送跟不上，部分音频未能转写。"
         case .timeout: "连接 OpenAI 超时。"
@@ -494,6 +495,7 @@ enum AppFailure: LocalizedError {
         case .systemAudio: "system_audio_start_failed"
         case .systemAudioDenied: "system_audio_denied"
         case .systemAudioInterrupted: "system_audio_interrupted"
+        case .systemAudioRequiresUpdate: "system_audio_requires_update"
         case .audioFormat: "audio_format"
         case .audioOverload: "audio_overload"
         case .timeout: "connection_timeout"

@@ -1,6 +1,5 @@
 import Foundation
 import AVFoundation
-import CoreMedia
 
 @main
 struct CoreChecks {
@@ -385,29 +384,20 @@ struct CoreChecks {
     }
 
     private static func checkSystemAudioConversion() async throws {
-        let frameCount = 4_800
-        let samples = [Float](repeating: 0.15, count: frameCount)
-        let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: false)!
-        var data: CMBlockBuffer?
-        let length = frameCount * MemoryLayout<Float>.size
-        let bufferStatus = CMBlockBufferCreateWithMemoryBlock(
-            allocator: nil, memoryBlock: nil, blockLength: length, blockAllocator: nil, customBlockSource: nil,
-            offsetToData: 0, dataLength: length, flags: 0, blockBufferOut: &data
-        )
-        precondition(bufferStatus == noErr)
-        let dataStatus = samples.withUnsafeBytes {
-            CMBlockBufferReplaceDataBytes(with: $0.baseAddress!, blockBuffer: data!, offsetIntoDestination: 0, dataLength: length)
+        let frameCount: AVAudioFrameCount = 4_800
+        for interleaved in [false, true] {
+            let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: interleaved)!
+            let input = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount)!
+            input.frameLength = frameCount
+            input.floatChannelData![0].update(repeating: 0.15, count: Int(frameCount))
+            try await checkSystemAudioPackets(input)
         }
-        precondition(dataStatus == noErr)
-        var sample: CMSampleBuffer?
-        let sampleStatus = CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-            allocator: nil, dataBuffer: data!, formatDescription: format.formatDescription,
-            sampleCount: frameCount, presentationTimeStamp: .zero, packetDescriptions: nil, sampleBufferOut: &sample
-        )
-        precondition(sampleStatus == noErr)
+    }
 
+    private static func checkSystemAudioPackets(_ input: AVAudioPCMBuffer) async throws {
         let processor = AudioProcessor()
-        processor.queue.sync { processor.ingestSystemSample(sample!) }
+        processor.ingestSystemAudio(input.audioBufferList, format: input.format)
+        input.floatChannelData![0].update(repeating: 0, count: Int(input.frameLength))
         processor.finish()
         var audioBytes = 0
         var committed = false

@@ -404,7 +404,7 @@ struct SettingsView: View {
                 Picker("输入源", selection: $preferences.audioInputID) {
                     ForEach(preferences.audioChoices) { Text($0.label).tag($0.id) }
                 }
-                .settingsHelp("下次开始录制时生效。系统声音需要 macOS 的屏幕与系统音频录制权限。")
+                .settingsHelp("下次开始录制时生效。系统声音需要 macOS 14.2 或更新版本，只请求系统音频权限。")
             }
             Section("分句") {
                 Slider(value: Binding(

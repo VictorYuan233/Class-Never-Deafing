@@ -12,7 +12,7 @@ final class SettingsHelp: ObservableObject {
         self.owner = owner
         guard let window = NSApp.keyWindow else { return }
         pending = Task { [weak self, weak window] in
-            do { try await Task.sleep(for: .seconds(1)) }
+            do { try await Task.sleep(for: .milliseconds(500)) }
             catch { return }
             guard let self, let window, window.isKeyWindow, window.attachedSheet == nil else { return }
             self.show(text, over: window)
