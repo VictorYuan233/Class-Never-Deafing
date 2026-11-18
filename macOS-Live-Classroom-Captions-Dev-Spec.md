@@ -19,12 +19,12 @@
 | UI-05 | 字体与滚动 | 原文和译文分别设置字体样式、字号、颜色、粗体、斜体。接近底部时跟随新增字幕并留一行空白。主动向上翻看时保持当前位置。 |
 | LANG-01 | 源语言与目标语言 | 字幕窗、菜单栏和设置均可选择并保存。默认源语言「自动检测」，默认目标语言「普通话（简体中文）」。录制中，源语言从下一段生效，目标语言用于下一次提交的段落。 |
 | AUDIO-01 | 音频输入 | 支持系统默认麦克风、单独选择已连接的麦克风或系统播放的声音，设置在下一次开始录制时生效。菜单栏图标的右键菜单及设置均可选择。 |
-| CAP-01 | 原文流式字幕 | 点击开始后读取所选的音频源。原文在窗底随老师说话增量更新，在定稿后移入双语记录。 |
+| CAP-01 | 原文流式字幕 | 点击开始后读取所选的音频源。原文随老师说话增量更新，可完整换行和滚动查看。连续未转写的空段合并为一行提示。 |
 | CAP-02 | 自动分段 | 正常停顿自动结束一段。连续讲话到时长上限时也会切段。等待译文期间，下一段原文继续出现。 |
 | CAP-03 | 双语对齐 | **每段原文在上，目标语言译文从下一行开始。** 窗口窄时原文和译文可各自换行。译文按段更新，乱序返回时仍写回对应原文下方。 |
-| CAP-04 | 控制、计时与反馈 | 字幕窗和菜单栏提供开始、暂停／继续及停止。暂停停止采音，继续时保留已生成的字幕。字幕窗仅用图标提供控制，采用颜色圆点表示状态并提供可访问名称和悬停提示。显示累计采音时间，暂停和重新连接期间不累计。 |
-| API-01 | 用户填写 API Key | 在「设置 → OpenAI API」粘贴或输入自有项目 Key，并可保存、替换或删除。输入默认遮挡，重启后可使用已保存的 Key。缺少 Key 时，点击开始显示配置入口。 |
-| EXP-01 | 停止后自动保存 | 停止采音并收尾后，将该节课全部已完成的原文和译文自动写入 UTF-8 `.txt`，保存目录可在设置中选择，字幕窗可在 Finder 中显示文件。菜单栏也可另存一份。 |
+| CAP-04 | 控制、计时与反馈 | 字幕窗和菜单栏提供开始、暂停／继续及停止。暂停停止采音，继续时保留已生成的字幕。设置可开启无声自动暂停，并设定等待分钟数。字幕窗仅用图标提供控制，采用颜色圆点表示状态并提供可访问名称和悬停提示。显示累计采音时间，暂停和重新连接期间不累计。 |
+| API-01 | 独立 API 设置 | 在「设置 → 转写」和「设置 → 翻译」分别配置基础地址、API Key 和模型，密钥可保存、替换或删除。每组提供测试按钮。缺少 Key 时，点击开始显示配置入口。 |
+| EXP-01 | 停止后保存 | 默认自动保存 `.mp3` 和同名 UTF-8 `.txt`。字幕窗支持停止并用自定义名称和目录另存两份文件。自动保存可关闭，保留天数设为 0 时无限期保留。 |
 
 显示示例：
 
@@ -41,13 +41,13 @@
 | 模块 | 工具 | 职责 |
 |---|---|---|
 | macOS 应用 | Swift、SwiftUI、AppKit | SwiftUI 渲染字幕和设置。AppKit `NSPanel` 承载独立窗口，使用 `NSHostingView` 加载字幕视图。 |
-| 声音采集 | AVFoundation、Core Audio、ScreenCaptureKit | 麦克风使用 AVAudioEngine，指定设备通过 Core Audio 的设备 ID 选择。系统声音使用 ScreenCaptureKit 的音频回调，需要系统授权。两条路径统一转换为 24 kHz 单声道 PCM16。 |
+| 声音采集 | AVFoundation、Core Audio | 麦克风使用 AVAudioEngine，指定设备通过 Core Audio 的设备 ID 选择。macOS 14.2 起通过 Core Audio 私有 tap 采集系统声音，只申请系统音频权限。两条路径统一转换为 24 kHz 单声道 PCM16。 |
 | 自动分段 | Swift 客户端语音活动检测（VAD） | 先用短帧能量、自适应噪声底和持续帧数做可测试的基线。麦克风使用更灵敏的有声门槛。用实录验证后再决定是否采用专用 VAD。 |
-| 网络 | Foundation URLSession | 个人开发版由原生 App 直接建立 OpenAI WebSocket 和 HTTPS 连接。用户自己的 Key 从本机钥匙串读取，仅用于当前课程。交付为独立 .app，可用 Swift 命令行工具构建。 |
-| 密钥设置 | SwiftUI `SecureField`、Security / macOS Keychain | 在 App 内保存、更新和删除项目 Key。设置页显示配置状态。 |
+| 网络 | Foundation URLSession | App 直接连接各自配置的兼容 API。远程地址使用 HTTPS，连接不会跟随重定向。交付为独立 .app，可用 Swift 命令行工具构建。 |
+| 密钥设置 | SwiftUI `SecureField`、CryptoKit AES-GCM | 两组 Key 绑定各自的基础地址，在本机应用数据目录分别加密保存。 |
 | 双语导出 | AppKit `NSSavePanel`、Foundation、`UTType.plainText` | 选择路径和文件名，生成 UTF-8 纯文本。 |
-| 原文转写 | OpenAI Realtime API、`gpt-live-transcribe` | 自动检测模式省略 `languages`，手动模式发送单一语言提示，如 `languages: ["en"]`。两种模式均用 `delay: "low"`。自动模式按实际语音转写，界面显示所选模式。 |
-| 译文 | OpenAI Responses API、`gpt-6-luna` | 原文段完成后按该段提交时的目标语言生成流式译文，使用 `reasoning.effort: "none"`。 |
+| 原文转写 | 兼容的 Realtime 或音频转写接口 | 默认使用 `gpt-live-transcribe`。Realtime 手动选语言时发送 `languages`，自动检测时省略。自定义模型通过 `audio/transcriptions` 分段提交。 |
+| 译文 | 兼容的 Responses 或 Chat Completions | 默认使用 Responses 和 `gpt-6-luna`。原文段完成后按该段提交的目标语言生成流式译文。 |
 
 在窗口层，置顶开关对应 `NSWindow.level` 的 `.floating` 与 `.normal`。面板需要能在其他应用活动时保持可见，设置打开后允许用户主动操作。背景透明度应用在 SwiftUI 背景层，文本保持正常不透明度。窗口尺寸建议默认 720 × 240 pt，最小 360 × 160 pt，最终以小屏和外接屏实测为准。
 
@@ -55,7 +55,7 @@
 
 1. **开始会话。** 读取 Key、语言、模型及音频源。Realtime 配置成功并获得所选输入的权限后开始采音。
 2. **边听边显示原文。** 采音回调复制音频送入有界缓冲，后台重采样为 24 kHz 单声道 PCM16。语音开始时附带短前置音频。每段首包直接发送，后续音频以约 80 毫秒发送一包，提交前发送剩余音频。原文和译文的增量分别合并发布到主线程，最终文本到达后立即替换。
-3. **自动结束一段。** 初始参数为 **180 ms 前置缓存、约 0.84 秒停顿、12 秒段长上限**。可在设置里调整。最右档沿用 0.4.1 的约 1.5 秒停顿、30 秒上限和整段翻译规则。连续语音约 8 秒后，遇到约 0.44 秒停顿即可提前提交。安静时只保留前置缓存。
+3. **自动结束一段。** 标准档为 **180 ms 前置缓存、约 0.72 秒停顿、12 秒段长上限**。可在设置里调整。最右档沿用 0.4.1 的约 1.5 秒停顿、30 秒上限和整段翻译规则。连续语音约 8 秒后，遇到约 0.40 秒停顿即可提前提交。安静时只保留前置缓存。
 4. **并行翻译。** 每段原文定稿后立即显示并进入翻译队列。翻译在独立的 actor 中调用 Responses API，按段 ID 回填整段译文。目标语言提示词要求保留数字、否定、条件、公式符号和术语。实时转写返回空文本或失败时，近期内存音频可通过文件转写接口补识别，较轻的音频可放大最多约 12 dB。音量门槛以上不足 160 毫秒且两次均无文字的片段略过空字幕。
 5. **维持顺序。** 以连接和上游 `item_id` 对齐转写，以本地段标识更新译文，按采音顺序显示。暂停和停止时先停音频输入并提交有效尾段。停止后等待结果或收尾超时，再自动保存。
 
@@ -73,16 +73,18 @@
 
 ### 3.3 API Key 的填写和使用
 
-- 「设置 → OpenAI API」接收用户的 Key，保存时去除首尾空白。显示已配置状态，可替换或删除。Keychain 保存后重启可用。
-- 钥匙串无法授权时，用户可主动选择「仅本次使用」。临时 Key 只存在 App 内存中，优先供本次运行的请求使用，可在设置中清除，退出后自动清除。
-- 每次开始时在后台读取凭据，使用 10 秒的等待上限，并允许取消启动。在 OpenAI 请求的鉴权头中使用凭据。运行中维持本课凭据，替换或删除在下次开始时生效。Key 不写入日志、URL、普通偏好或导出。
+- 两组 Key 分别保存，并绑定对应的 API 地址。更换服务地址后需要重新输入该服务的 Key。升级自旧版时需重新输入两组 Key。
+- 测试转写发送内置音频，测试翻译发送固定文本，显示实际结果或服务端错误。测试可用尚未保存的 Key。
+- 每次开始时读取两组配置，改变请求目的地时显示确认。当前课程使用开始时的配置。Key 仅用于鉴权头，不写入日志、URL、普通偏好或导出。
 - 提示缺少 Key、无效 Key、项目权限不足、额度不足或遇到请求限流等可处理状态。
 
 ### 3.4 保存整节课的双语文本
 
-结束课程后，应用从字幕存储生成完整快照，包括已滚出悬浮窗的早期段落。自动保存目录可在「设置 → 保存」中选择，默认 `~/Library/Application Support/课堂字幕/课堂记录/`。文件名包含日期、时间和短标识。成功后可在字幕窗打开 Finder 定位文件。菜单栏另存时可自定义名称与目录。
+结束课程后，应用从字幕存储生成完整快照，包括已滚出悬浮窗的早期段落。录音在每次采音时写入同一文件，暂停期间停止写入，继续时接着录。自动保存目录可在「设置 → 保存」中选择，默认 `~/Library/Application Support/课堂字幕/课堂记录/`。两份文件的名称使用相同的日期、时间和短标识。可从菜单栏在 Finder 中定位文件，或将双语文本另存为指定名称和目录。
 
-按课堂顺序导出，每段为**原文一行、译文下一行，段与段之间空一行**。仅采用确认后的原文和译文；如果某段原文已完成而译文收尾超时或失败，保留原文，在下一行写「[翻译未完成]」。若没有可保存的最终文本，则不生成空文件。取消保存或写入失败时保留课堂字幕，允许重新保存。
+「停止并另存为」先终止采集并收尾，再允许指定共同的文件名和位置。自动保存开启时默认目录和手动位置各保留一份。关闭后，普通停止清理暂存录音，仅手动导出可将本次文件写入指定位置。每次自动写入新记录后，按默认目录中符合自动命名的文件修改时间清理过期音频和同名文本。
+
+按课堂顺序导出，每段为**录音时间与原文一行、译文下一行，段与段之间空一行**。时间使用该段第一个有声帧在录音中的位置，格式为 `[HH:mm:ss]`，暂停期间不计时。仅采用确认后的原文和译文。如果某段原文已完成而译文收尾超时或失败，保留原文，在下一行写「[翻译未完成]」。若没有可保存的最终文本，则不生成空文件。取消保存或写入失败时保留课堂字幕，允许重新保存。
 
 ```text
 The model overfits the training data.
@@ -95,15 +97,15 @@ Cross-validation helps us estimate how well it generalizes.
 ## 4. 源码与构建
 
 - `Sources/ClassroomCaptions/` 包含界面、录音分段、网络、会话状态及导出。
-- `scripts/build.sh` 通过 Swift 命令行工具生成并本地签名 arm64 .app。菜单栏图标的右键菜单最后两项依次是「设置」和「退出」，使用指南和详情位于设置页底部。入口和测试步骤见 README。构建时核对 Info.plist、内置指南和「详情」更新说明的版本。
-- 窗口和语言偏好用 UserDefaults，密钥用 Keychain。个人开发版直接连接 OpenAI。分发版本需单独确定后端与凭据方案。
+- `scripts/build.sh` 通过 Swift 命令行工具生成并本地签名 arm64 .app。菜单栏图标的右键菜单最后两项依次是「设置」和「退出」。「使用指南」与「关于」位于设置页底部。入口和测试步骤见 README。构建时核对 Info.plist、内置指南和「关于」更新说明的版本。
+- 窗口和语言偏好用 UserDefaults，密钥密文与随机生成的解密文件存于应用数据目录。个人开发版直接连接所配置的服务。
 
 ## 5. 计费、错误恢复与隐私
 
 - **计费**　实时转写按发送的音频时长计费，标价 **US$0.017／分钟**。持续发送 90 分钟约 **US$1.53**，翻译按文本模型 token 另计。两者可使用同一 API 项目；项目和密钥需具备相应权限。ChatGPT Plus 账单独立。
-- **凭据**　长期 API Key 存在当前用户的 Keychain。Mac App 仅在使用时读取，用于当前用户发起的 OpenAI 请求。第一版为同一台 Mac 上的个人模式；分发给他人前需明确凭据及访问控制方案。
+- **凭据**　API Key 使用 AES-GCM 加密保存。拥有当前 macOS 账户文件访问权限的程序仍可读取加密文件和解密材料。请求错误在显示前遮挡本次请求的 API Key。
 - **错误恢复**　权限错误指引到「系统设置 → 隐私与安全性 → 麦克风」。连接中断时采用有限重试并保留已显示字幕；认证、余额或项目权限错误显示明确原因。翻译失败保留原文，该失败段可单独重试，后续分段继续运行。
-- **数据**　原始音频不落盘，课文字幕默认只保存在当前会话内存中。用户停止后自动保存双语文本，或可手动另存一份。诊断日志保存到 ~/Library/Logs/Class Never Deafing/diagnostics.log，上限 1 MiB，超限时删掉最早记录。记录阶段、数字错误码、每 10 秒的音量摘要、空转写及分段的音频发送等待、转写和翻译耗时，避免写入 API Key、音频和字幕。音频会送往 OpenAI，界面在首次开始前明确告知。
+- **数据**　会话音频在本机暂存为 WAV，停止后通过内置 LAME 编码器保存为 MP3。如果编码失败，保留 WAV。用于转写的片段送往 OpenAI，界面在首次开始前明确告知。课文字幕保存在当前会话内存中，停止后自动保存双语文本，或可手动另存一份。诊断日志保存到 ~/Library/Logs/Class Never Deafing/diagnostics.log，上限 1 MiB，超限时删掉最早记录。记录阶段、数字错误码、每 10 秒的音量摘要、空转写及分段的音频发送等待、转写和翻译耗时，避免写入 API Key、音频和字幕。
 
 ## 6. 验收与开发顺序
 
@@ -115,14 +117,14 @@ Cross-validation helps us estimate how well it generalizes.
 | 自动分段 | 用正常停顿、长静音和连续讲话样本测试。确认静音不新增空段、连续讲话仍会分段、停止时最后一段能收尾。 |
 | 延迟 | 用实际教室座位和麦克风测试。记录「开口到首字」及「段末到首个中文字」的 P50/P90。首轮工程目标分别为 **P90 ≤ 1.5 秒、P90 ≤ 2.5 秒**，以实测迭代，数值不代表供应商承诺。 |
 | 术语准确性 | 用英文课堂实录人工核对专名、数字、否定、条件与转折。分别记录英文转写错误和中文翻译错误，比较加词表前后的结果。 |
-| API Key 设置 | 在 M5 Mac 的已更新系统上，用设置页输入 Key 并重启应用，验证 Keychain 恢复和项目权限。分别测试空值、无效 Key、替换、删除，确认 UI、日志和导出文件不会显示 Key。 |
-| 双语文本导出 | 停止一节模拟课，确认自动保存并从字幕窗在 Finder 中定位文件。用「文本编辑」核对 UTF-8、顺序和双语分行。测试暂停后继续、另存取消、译文失败与写入失败。 |
+| API Key 设置 | 分别配置两个兼容服务，验证重开后仍可读取密钥。测试空值、错误密钥、模型错误、正确请求、替换、删除以及修改地址后阻止复用旧 Key。 |
+| 双语文本导出 | 停止一节模拟课，确认自动保存并从菜单栏在 Finder 中定位文件。用「文本编辑」核对 UTF-8、顺序和双语分行。测试暂停后继续、另存取消、译文失败与写入失败。 |
 | 课堂稳定性 | 做一次 90 分钟连续测试，包含一次人为断网、一次切换麦克风或设备失效、一次计划内会话续接。检查状态可见、恢复后继续分段、旧字幕无重复。 |
 
 建议按以下顺序实现：
 
 1. **悬浮窗与模拟字幕。** 先验收置顶、拖动、背景、尺寸和中英两行。
-2. **语言、API Key 和实时转写。** 接入语言选择、Keychain、音频转换、客户端分段和 Realtime 事件。
+2. **语言、API Key 和实时转写。** 接入语言选择、本地凭据、音频转换、客户端分段和 Realtime 事件。
 3. **目标语言流式翻译与双语导出。** 验证段 ID 配对、翻译失败恢复、长课续接和停止后自动保存。
 4. **在 M5 Mac 上课堂实测。** 调整停顿阈值、最大段长及课程词表，再决定是否需要更强的 VAD 或更方便的安装方式。
 
@@ -131,4 +133,4 @@ Cross-validation helps us estimate how well it generalizes.
 - OpenAI — [实时转写接口](https://developers.openai.com/api/docs/guides/realtime-transcription)、[Realtime 会话生命周期](https://developers.openai.com/api/docs/guides/realtime-conversations)
 - OpenAI — [实时转写模型及价格](https://developers.openai.com/api/docs/models/gpt-live-transcribe)、[GPT‑6 Luna](https://developers.openai.com/api/docs/models/gpt-6-luna)、[API Key 安全实践](https://help.openai.com/en/articles/5112595-best-practices-for-api-key-safety)
 - Apple — [NSPanel](https://developer.apple.com/documentation/appkit/nspanel)、[NSWindow 窗口层级](https://developer.apple.com/documentation/appkit/nswindow/level-swift.property)、[AVAudioEngine](https://developer.apple.com/documentation/avfaudio/avaudioengine)、[麦克风权限说明键](https://developer.apple.com/documentation/bundleresources/information-property-list/nsmicrophoneusagedescription)
-- Apple — [SecureField](https://developer.apple.com/documentation/swiftui/securefield)、[Keychain Services](https://developer.apple.com/documentation/security/keychain_services)、[NSSavePanel](https://developer.apple.com/documentation/appkit/nssavepanel)
+- Apple — [SecureField](https://developer.apple.com/documentation/swiftui/securefield)、[AES-GCM](https://developer.apple.com/documentation/cryptokit/aes/gcm)、[NSSavePanel](https://developer.apple.com/documentation/appkit/nssavepanel)

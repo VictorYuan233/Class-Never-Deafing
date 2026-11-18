@@ -3,10 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>0.6.4</string>
+    <string>1.0.2</string>
     <key>highlights</key>
     <array>
-        <string>设置新增「记录诊断日志」开关。关闭后停止记录，已保存的日志仍可查看。</string>
+        <string>防止把密钥、录音和字幕写入 Git 仓库。若旧设置指向 Git 仓库，改用本机默认保存目录。</string>
+        <string>使用指南列出密钥、偏好设置、课堂记录和诊断日志的本机路径。</string>
     </array>
 </dict>
 </plist>
