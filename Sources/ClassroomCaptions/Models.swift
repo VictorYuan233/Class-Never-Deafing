@@ -31,6 +31,7 @@ struct Language: Identifiable, Equatable {
 
 struct Caption: Identifiable {
     let id = UUID()
+    var position = 0
     var recordingStartSeconds: Int64?
     var original = ""
     var translation = ""
@@ -39,10 +40,15 @@ struct Caption: Identifiable {
     var originalFailed = false
     var translationFailed = false
     var translationLanguage = Language.simplified
+    var originalLanguage = Language.automatic
+    var captureID: UUID?
+    var waitsForContinuation = false
+    var mergedIntoPrevious = false
 
     static func visibleRows(_ captions: [Caption], drafts: [UUID: String]) -> [Caption] {
         var lastRowWasFailure = false
         return captions.compactMap { caption in
+            guard !caption.mergedIntoPrevious else { return nil }
             var row = caption
             if row.original.isEmpty, let text = drafts[row.id] { row.original = text }
             if !row.original.isEmpty {
@@ -53,6 +59,50 @@ struct Caption: Identifiable {
             lastRowWasFailure = true
             return row
         }
+    }
+}
+
+enum SentenceContinuation {
+    static let wait = Duration.milliseconds(1800)
+
+    private static let unfinishedEnd = try! NSRegularExpression(
+        pattern: #"\b(?:and|or|but|because|although|unless|whereas|such as|for example|in order to|as a result of|due to|depends on)$"#)
+    private static let subordinateStart = try! NSRegularExpression(
+        pattern: #"^(?:if|unless|although|even if|even though|whereas|because)\b"#)
+    private static let mainClause = try! NSRegularExpression(
+        pattern: #"\b(?:then|(?:we|you|they|he|she|it|i)\s+(?:can|could|will|would|should|must|may|might|need to))\b"#)
+    private static let freshStart = try! NSRegularExpression(
+        pattern: #"^(?:next|anyway|separately|moving on|in conclusion|on another note|thank you|thanks)\b"#)
+
+    static func needsMoreText(_ text: String, language: Language) -> Bool {
+        guard language == .english || language == .automatic else { return false }
+        let tail = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if tail.isEmpty || tail.hasSuffix("?") || tail.hasSuffix("!") || tail.hasSuffix("。") { return false }
+        let normalized = stripBoundary(tail).lowercased()
+        if matches(unfinishedEnd, in: normalized) { return true }
+        let words = normalized.split(whereSeparator: \.isWhitespace)
+        return (2...10).contains(words.count) && matches(subordinateStart, in: normalized) &&
+            normalized.rangeOfCharacter(from: CharacterSet(charactersIn: ",;:.!?")) == nil &&
+            !matches(mainClause, in: words.dropFirst(3).joined(separator: " "))
+    }
+
+    static func joined(_ first: String, _ next: String) -> String? {
+        let head = next.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard head.first?.isASCII == true, head.first?.isLetter == true || head.first?.isNumber == true,
+              !matches(freshStart, in: head.lowercased()) else { return nil }
+        let prefix = stripBoundary(first.trimmingCharacters(in: .whitespacesAndNewlines))
+        let followsClause = !matches(unfinishedEnd, in: prefix.lowercased())
+        let separator = followsClause ? ", " : " "
+        return prefix + separator + head
+    }
+
+    private static func stripBoundary(_ text: String) -> String {
+        String(text.reversed().drop(while: { ".,…—–".contains($0) }).reversed())
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func matches(_ pattern: NSRegularExpression, in text: String) -> Bool {
+        pattern.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
     }
 }
 
@@ -461,15 +511,17 @@ enum TextExport {
     }
 
     static func render(_ captions: [Caption]) -> String {
-        let blocks = captions.compactMap { caption -> String? in
-            let original = line(caption.original)
-            guard caption.originalFinal, !original.isEmpty else { return nil }
-            let translation = line(caption.translation)
-            let target = caption.translationFinal && !translation.isEmpty ? translation : "[翻译未完成]"
-            let timestamp = caption.recordingStartSeconds.map { "[\(RecordingClock.format(seconds: $0))] " } ?? ""
-            return timestamp + original + "\n" + target
-        }
+        let blocks = captions.compactMap(block)
         return blocks.isEmpty ? "" : blocks.joined(separator: "\n\n") + "\n"
+    }
+
+    static func block(_ caption: Caption) -> String? {
+        let original = line(caption.original)
+        guard caption.originalFinal, !caption.mergedIntoPrevious, !original.isEmpty else { return nil }
+        let translation = line(caption.translation)
+        let target = caption.translationFinal && !translation.isEmpty ? translation : "[翻译未完成]"
+        let timestamp = caption.recordingStartSeconds.map { "[\(RecordingClock.format(seconds: $0))] " } ?? ""
+        return timestamp + original + "\n" + target
     }
 
     static func saveAutomatically(_ content: String, to destination: SessionExport) throws -> URL {

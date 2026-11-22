@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.0.2</string>
+    <string>1.0.5</string>
     <key>highlights</key>
     <array>
-        <string>防止把密钥、录音和字幕写入 Git 仓库。若旧设置指向 Git 仓库，改用本机默认保存目录。</string>
-        <string>使用指南列出密钥、偏好设置、课堂记录和诊断日志的本机路径。</string>
+        <string>实时字幕窗保留最近 20 分钟，开始／暂停／继续使用同一个按钮。</string>
+        <string>开启自动保存时边录边归档定稿字幕。菜单栏可分页查看本节课历史，停止后仍导出完整双语文本。</string>
     </array>
 </dict>
 </plist>

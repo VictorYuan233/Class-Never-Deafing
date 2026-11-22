@@ -8,10 +8,9 @@
     <key>CFBundleDisplayName</key><string>Class Never Deafing</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>CFBundleVersion</key><string>31</string>
-    <key>CFBundleShortVersionString</key><string>1.0.2</string>
+    <key>CFBundleVersion</key><string>34</string>
+    <key>CFBundleShortVersionString</key><string>1.0.5</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
-    <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Class Never Deafing 从所选麦克风录音，并将用于转写的音频发送给你配置的转写服务生成字幕。</string>
     <key>NSAudioCaptureUsageDescription</key>

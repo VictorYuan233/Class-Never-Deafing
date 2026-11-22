@@ -24,8 +24,10 @@ struct CoreChecks {
         checkCaptionScroll()
         checkRecordingClock()
         try checkExport()
+        checkSentenceContinuation()
         try checkPrivateDataLocation()
         try checkExportArchive()
+        try checkTranscriptArchive()
         try await checkSessionRecording()
         print("通过：独立 API 地址与密钥、密钥加密和错误脱敏、翻译与转写请求、字幕窗快捷键、诊断日志、音频分段、字幕录音配对保存。")
     }
@@ -503,6 +505,28 @@ struct CoreChecks {
         }
     }
 
+    private static func checkSentenceContinuation() {
+        let first = "If interest rates stay high."
+        let second = "companies may put off new investments."
+        precondition(SentenceContinuation.needsMoreText(first, language: .automatic))
+        precondition(SentenceContinuation.needsMoreText("The method works because.", language: .english))
+        precondition(!SentenceContinuation.needsMoreText("If inflation rises, we will respond.", language: .english))
+        precondition(!SentenceContinuation.needsMoreText("The answer is 3.14.", language: .automatic))
+        precondition(!SentenceContinuation.needsMoreText(first, language: .simplified))
+        precondition(SentenceContinuation.joined(first, "Next, we'll discuss GDP.") == nil)
+        precondition(SentenceContinuation.joined(first, "我们来看看下一题。") == nil)
+        precondition(SentenceContinuation.joined("This works because.", "it is faster.") == "This works because it is faster.")
+        let merged = SentenceContinuation.joined(first, second)!
+        precondition(merged == "If interest rates stay high, companies may put off new investments.")
+        let captions = [
+            Caption(recordingStartSeconds: 12, original: merged, translation: "如果利率持续走高，企业可能会推迟新的投资。",
+                    originalFinal: true, translationFinal: true),
+            Caption(recordingStartSeconds: 14, original: second, originalFinal: true, mergedIntoPrevious: true),
+        ]
+        precondition(Caption.visibleRows(captions, drafts: [:]).count == 1)
+        precondition(TextExport.render(captions) == "[00:00:12] \(merged)\n如果利率持续走高，企业可能会推迟新的投资。\n")
+    }
+
     private static func checkExportArchive() throws {
         let fm = FileManager.default
         let folder = fm.temporaryDirectory.appending(path: UUID().uuidString)
@@ -537,6 +561,37 @@ struct CoreChecks {
             precondition(fm.fileExists(atPath: recent.fileURL(endingIn: ext).path))
             precondition(fm.fileExists(atPath: copy.fileURL(endingIn: ext).path))
         }
+    }
+
+    private static func checkTranscriptArchive() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let archive = TranscriptArchive(name: "class-fixture", folder: folder)
+        let hours = 3.5
+        let intervals = Int(hours * 3600) / 5
+        let entries = (0..<intervals).map { index in
+            let caption = Caption(position: index, recordingStartSeconds: Int64(index * 5),
+                                  original: "Caption number \(index).", translation: "字幕 \(index)。",
+                                  originalFinal: true, translationFinal: true)
+            return TranscriptArchive.Entry(id: index, text: TextExport.block(caption)!)
+        }
+        precondition(TranscriptArchive.visibleSeconds == 1200)
+        for offset in stride(from: 0, to: intervals, by: 49) {
+            try archive.write(Array(entries[offset..<min(offset + 49, intervals)]))
+        }
+        try archive.write([entries[0]])
+        let first = try archive.read(limit: TranscriptArchive.pageSize)
+        let second = try archive.read(before: first.last!.id, limit: TranscriptArchive.pageSize)
+        precondition(first.first?.id == intervals - 1 && second.first?.id == intervals - 101)
+        let archived = try archive.read()
+        precondition(archived.count == intervals)
+        let revised = TranscriptArchive.Entry(id: intervals - 1, text: "[03:29:55] Final caption.\n结尾。")
+        let output = TranscriptArchive.render(archived: archived, recent: [revised])
+        precondition(output.hasPrefix("[00:00:00] Caption number 0.") && output.hasSuffix("Final caption.\n结尾。\n"))
+        precondition(output.components(separatedBy: "\n\n").count == intervals)
+        archive.discard()
+        precondition(!FileManager.default.fileExists(atPath: archive.url.path))
+        precondition((try? archive.read()) == nil)
     }
 
     private static func checkSessionRecording() async throws {

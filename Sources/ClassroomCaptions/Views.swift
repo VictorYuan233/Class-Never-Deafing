@@ -1,6 +1,79 @@
 import AppKit
 import SwiftUI
 
+struct TranscriptHistoryView: View {
+    @ObservedObject var session: ClassroomSession
+    @StateObject private var page = HistoryPage()
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            HStack {
+                Button("较新") { page.cursors.removeLast() }.disabled(page.cursors.count < 2 || page.loading)
+                Button("较早") {
+                    if let last = page.entries.last { page.cursors.append(last.id) }
+                }
+                .disabled(!page.canLoadOlder || page.loading)
+                Spacer()
+                Button("刷新") {
+                    page.cursors = [.max]
+                    page.refresh += 1
+                }
+            }
+            if let error = page.error { Text(error).foregroundStyle(.red) }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(page.entries) { entry in
+                        Text(entry.text)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+        .padding()
+        .task(id: PageID(session: session.historyID, before: page.cursors.last ?? .max, refresh: page.refresh)) {
+            await load(before: page.cursors.last ?? .max)
+        }
+        .onChange(of: session.historyID) { _, _ in
+            page.entries = []
+            page.canLoadOlder = false
+            page.cursors = [.max]
+        }
+    }
+
+    private func load(before: Int) async {
+        let sessionID = session.historyID
+        let refresh = page.refresh
+        page.loading = true
+        defer { if !Task.isCancelled { page.loading = false } }
+        do {
+            let entries = try await session.historyPage(before: before)
+            guard !Task.isCancelled, session.historyID == sessionID, page.cursors.last == before, page.refresh == refresh else { return }
+            page.entries = Array(entries.prefix(TranscriptArchive.pageSize))
+            page.canLoadOlder = entries.count > TranscriptArchive.pageSize
+            page.error = nil
+        } catch {
+            guard !Task.isCancelled, session.historyID == sessionID, page.cursors.last == before, page.refresh == refresh else { return }
+            page.error = "未能读取本节课历史。请刷新后重试。"
+        }
+    }
+
+    private struct PageID: Equatable {
+        let session: UUID
+        let before: Int
+        let refresh: Int
+    }
+
+    private final class HistoryPage: ObservableObject {
+        @Published var entries: [TranscriptArchive.Entry] = []
+        @Published var canLoadOlder = false
+        @Published var error: String?
+        @Published var cursors: [Int] = [.max]
+        @Published var loading = false
+        @Published var refresh = 0
+    }
+}
+
 struct CaptionView: View {
     @ObservedObject var session: ClassroomSession
     @ObservedObject var preferences: Preferences
@@ -57,7 +130,8 @@ struct CaptionView: View {
     }
 
     private func toolbar(compact: Bool) -> some View {
-        let paused = session.phase == .paused
+        let listening = session.phase == .listening
+        let canToggle = listening || session.phase == .paused || session.phase == .idle
         let buttonWidth: CGFloat = compact ? 22 : 26
         return HStack(spacing: compact ? 3 : 6) {
             Circle()
@@ -82,9 +156,10 @@ struct CaptionView: View {
                     .accessibilityValue(elapsed)
             }
             HStack(spacing: compact ? 2 : 4) {
-                control("开始", "play.fill", width: buttonWidth, enabled: session.phase == .idle, action: begin)
-                control(paused ? "继续" : "暂停", paused ? "play.fill" : "pause.fill",
-                        width: buttonWidth, enabled: paused || session.phase == .listening, action: togglePause)
+                control(listening ? "暂停" : session.phase == .paused ? "继续" : "开始",
+                        listening ? "pause.fill" : "play.fill", width: buttonWidth, enabled: canToggle) {
+                    if session.phase == .idle { begin() } else { togglePause() }
+                }
                 control("停止", "stop.fill", width: buttonWidth,
                         enabled: session.phase != .idle && session.phase != .stopping, action: stop)
                 toolbarButton("停止并另存为", width: buttonWidth, enabled: session.canStopAndSaveAs, action: stopAndSaveAs) {
@@ -180,7 +255,7 @@ struct CaptionView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         LazyVStack(alignment: .leading, spacing: 13) {
-                            ForEach(Caption.visibleRows(session.captions, drafts: session.liveDrafts.bound)) { caption in
+                            ForEach(Caption.visibleRows(session.visibleCaptions, drafts: session.liveDrafts.bound)) { caption in
                                 captionRow(caption)
                             }
                             ForEach(session.liveDrafts.unbound) { draft in
@@ -240,7 +315,7 @@ struct CaptionView: View {
                     .font(.system(size: 12, weight: .medium))
                     .overlay(alignment: .bottom) { Rectangle().frame(height: 1).opacity(0.45) }
             } else if caption.originalFinal && !caption.original.isEmpty {
-                Text("正在翻译…")
+                Text(caption.waitsForContinuation ? "等待续句…" : "正在翻译…")
                     .font(.system(size: 12))
                     .foregroundStyle(foreground.opacity(0.65))
             }
@@ -361,9 +436,9 @@ final class APIKeySettings: ObservableObject {
             testStatus = "正在请求 \(connection.endpoint.base.host ?? "API")…"
             testTask = Task {
                 do {
-                    let result = try await operation()
+                    _ = try await operation()
                     guard !Task.isCancelled else { return }
-                    testStatus = "测试通过 · \(APIResponseError.clean(result, key: connection.key))"
+                    testStatus = "测试通过"
                 } catch {
                     guard !Task.isCancelled else { return }
                     testStatus = "测试失败 · \(APIResponseError.clean(error.localizedDescription, key: connection.key))"
@@ -532,7 +607,7 @@ struct SettingsView: View {
                 Toggle("翻译 Fast 模式", isOn: preferences.translationModel.allowsFast ? $preferences.fastTranslation : .constant(false))
                     .disabled(!preferences.translationModel.allowsFast)
                     .onChange(of: preferences.fastTranslation) { _, _ in translationKey.clearTest() }
-                    .settingsHelp("开启时会请求 Fast。支持情况与费用取决于所选模型和服务商。")
+                    .settingsHelp("默认关闭。开启时会请求 Fast，支持情况与费用取决于所选模型和服务商。")
                 apiControls(translationKey)
             }
             Section("快捷键") {

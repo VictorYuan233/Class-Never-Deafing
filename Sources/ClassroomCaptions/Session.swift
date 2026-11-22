@@ -43,11 +43,19 @@ final class ClassroomSession: ObservableObject {
     @Published private(set) var automaticRecordingURL: URL?
     @Published private(set) var manualExportFiles: [URL] = []
     @Published private(set) var hasError = false
+    @Published private(set) var hasArchivedCaptions = false
+    @Published private(set) var historyID = UUID()
+    @Published private var visibleSince: Int64 = 0
     var exportFolder: URL?
     private var chooseSaveCopy: ((String, String?) async -> SessionExport?)?
 
     private var drafts = TranscriptDrafts()
     private var indices: [UUID: Int] = [:]
+    private var nextCaptionPosition = 0
+    private var transcriptArchive: TranscriptArchive?
+    private var archiveTask: Task<Void, Never>?
+    private var storedPositions: Set<Int> = []
+    private var archiveSaved = false
     private var submitted: [UUID: SubmittedSegment] = [:]
     private var recoveryQueue: [Recovery] = []
     private var recoveryWorkers: [UUID: Task<Void, Never>] = [:]
@@ -56,6 +64,7 @@ final class ClassroomSession: ObservableObject {
     private var translationRefresh: Task<Void, Never>?
     private var workers: [UUID: Task<Void, Never>] = [:]
     private var translationQueue: [TranslationJob] = []
+    private var continuationTimers: [UUID: Task<Void, Never>] = [:]
     private var sessionTask: Task<Void, Never>?
     private var stopDeadline: Task<Void, Never>?
     private var rotation: Task<Void, Never>?
@@ -78,7 +87,21 @@ final class ClassroomSession: ObservableObject {
     private var pausedForSilence = false
 
     var canExport: Bool {
-        phase == .idle && captions.contains { $0.originalFinal && !$0.original.isEmpty }
+        phase == .idle && hasHistory
+    }
+
+    var hasHistory: Bool {
+        hasArchivedCaptions || captions.contains { $0.originalFinal && !$0.mergedIntoPrevious && !$0.original.isEmpty }
+    }
+
+    var visibleCaptions: [Caption] {
+        return captions.filter { caption in
+            let mayHide = transcriptArchive == nil || storedPositions.contains(caption.position) ||
+                caption.mergedIntoPrevious || caption.original.isEmpty
+            return !mayHide || (caption.recordingStartSeconds ?? .max) >= visibleSince || !caption.originalFinal ||
+                caption.waitsForContinuation || caption.translationFailed ||
+                (!caption.translationFinal && !caption.mergedIntoPrevious && !caption.original.isEmpty)
+        }
     }
 
     var savedFiles: [URL] { manualExportFiles.isEmpty ? [automaticExportURL, automaticRecordingURL].compactMap { $0 } : manualExportFiles }
@@ -109,9 +132,11 @@ final class ClassroomSession: ObservableObject {
                     sessionTask = nil
                     return
                 }
-                prepare(apis: apis, audioInputID: audioInputID, segmentationLength: segmentationLength)
                 let recording = automaticSave ? SessionRecording() : SessionRecording(
                     stagingFolder: FileManager.default.temporaryDirectory.appending(path: "Class Never Deafing"))
+                prepare(apis: apis, audioInputID: audioInputID, segmentationLength: segmentationLength)
+                if automaticSave { transcriptArchive = TranscriptArchive(name: recording.name) }
+                startArchiveTimer()
                 await run(recording: recording, automaticSave: automaticSave, retentionDays: retentionDays)
             } catch {
                 guard !Task.isCancelled else { return }
@@ -129,6 +154,14 @@ final class ClassroomSession: ObservableObject {
         apis: SessionAPIs, audioInputID: String, segmentationLength: SegmentationLength
     ) {
         cancelTranslations()
+        discardSavedArchive()
+        transcriptArchive = nil
+        hasArchivedCaptions = false
+        historyID = UUID()
+        visibleSince = 0
+        archiveSaved = false
+        storedPositions.removeAll()
+        nextCaptionPosition = 0
         captions.removeAll()
         indices.removeAll()
         drafts = TranscriptDrafts()
@@ -277,11 +310,23 @@ final class ClassroomSession: ObservableObject {
             audio = .init()
         }
         await drainResults()
-        let text = TextExport.render(captions)
+        archiveTask?.cancel()
+        await archiveTask?.value
+        archiveTask = nil
+        await persistCaptions(evictOld: false)
+        updateVisibleRange()
         var warnings = [audio.warning].compactMap { $0 }
+        let text: String
+        do { text = try await completeTranscript().value }
+        catch {
+            AppLog.failure("transcript.archive.read_failed", error)
+            warnings.append("归档读取失败，已保留归档和当前字幕。可重试从菜单栏另存本节课文本。")
+            text = ""
+        }
         if let destination, stoppedByUser, !text.isEmpty {
             do {
                 automaticExportURL = try TextExport.saveAutomatically(text, to: destination)
+                archiveSaved = true
                 AppLog.event("export.success")
             } catch {
                 AppLog.failure("export.failed", error)
@@ -298,6 +343,7 @@ final class ClassroomSession: ObservableObject {
                     manualExportFiles = try await Task.detached(priority: .utility) {
                         try ExportArchive.saveCopy(text: text, audio: audio.url, to: copy)
                     }.value
+                    if !text.isEmpty { archiveSaved = true }
                     break
                 } catch {
                     AppLog.failure("export.copy.failed", error)
@@ -430,8 +476,10 @@ final class ClassroomSession: ObservableObject {
         stopDeadline?.cancel()
         stopDeadline = nil
 
-        while !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty || !workers.isEmpty || !translationQueue.isEmpty {
+        while !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty || !workers.isEmpty ||
+                !translationQueue.isEmpty || !continuationTimers.isEmpty {
             if Task.isCancelled { break }
+            if recoveryWorkers.isEmpty && recoveryQueue.isEmpty { flushContinuations() }
             if phase == .stopping {
                 let pendingRecovery = !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty
                 let message = pendingRecovery ? "正在处理剩余音频…" : "正在补齐译文…"
@@ -445,6 +493,7 @@ final class ClassroomSession: ObservableObject {
         if let active { retire(active) }
         active = nil
         publishOriginal()
+        flushContinuations()
         phase = .paused
         status = pausedForSilence ? "无声超时，已自动暂停" : "已暂停"
     }
@@ -465,6 +514,7 @@ final class ClassroomSession: ObservableObject {
             }
         }
         defer { if let observer { NotificationCenter.default.removeObserver(observer) } }
+        let captureID = UUID()
         var segment: UUID?
         var segmentSource = source
         var pcm = Data()
@@ -476,7 +526,9 @@ final class ClassroomSession: ObservableObject {
                     if segment == nil {
                         if service.selection != .custom { await switchSourceAtBoundary() }
                         segmentSource = active?.configuredSource ?? source
-                        let caption = Caption(recordingStartSeconds: packet.recordingStartSeconds)
+                        let caption = Caption(position: nextCaptionPosition, recordingStartSeconds: packet.recordingStartSeconds,
+                                              originalLanguage: segmentSource, captureID: captureID)
+                        nextCaptionPosition += 1
                         indices[caption.id] = captions.count
                         captions.append(caption)
                         segment = caption.id
@@ -750,10 +802,60 @@ final class ClassroomSession: ObservableObject {
         caption.originalFailed = text.isEmpty && !omitIfEmpty
         captions[index] = caption
         if text.isEmpty && omitIfEmpty { AppLog.event("transcription.empty.low_signal") }
-        if !text.isEmpty, let service = apis?.translation {
-            translationQueue.append(TranslationJob(id: id, service: service))
-            startQueuedTranslations()
+        arrangeTranslation(at: index)
+    }
+
+    private func arrangeTranslation(at index: Int) {
+        let caption = captions[index]
+        if index > 0 {
+            let previous = captions[index - 1]
+            if previous.waitsForContinuation, previous.position + 1 == caption.position {
+                if previous.translationLanguage == caption.translationLanguage,
+                   previous.originalLanguage == caption.originalLanguage,
+                   previous.captureID == caption.captureID,
+                   let joined = SentenceContinuation.joined(previous.original, caption.original) {
+                    var updated = captions
+                    updated[index - 1].original = joined
+                    updated[index].mergedIntoPrevious = true
+                    captions = updated
+                    AppLog.event("translation.continuation.merged")
+                    releaseContinuation(previous.id)
+                    return
+                }
+                releaseContinuation(previous.id)
+            }
         }
+        guard !caption.original.isEmpty else { return }
+        let nextAlreadyFinal = index + 1 < captions.count &&
+            (captions[index + 1].originalFinal || captions[index + 1].position != caption.position + 1)
+        if (phase == .listening || phase == .stopping), !nextAlreadyFinal,
+           SentenceContinuation.needsMoreText(caption.original, language: caption.originalLanguage) {
+            captions[index].waitsForContinuation = true
+            continuationTimers[caption.id] = Task { [weak self] in
+                do { try await Task.sleep(for: SentenceContinuation.wait) }
+                catch { return }
+                self?.releaseContinuation(caption.id)
+            }
+        } else {
+            queueTranslation(caption.id)
+        }
+    }
+
+    private func releaseContinuation(_ id: UUID) {
+        continuationTimers.removeValue(forKey: id)?.cancel()
+        guard let index = indices[id], captions[index].waitsForContinuation else { return }
+        captions[index].waitsForContinuation = false
+        queueTranslation(id)
+    }
+
+    private func flushContinuations() {
+        for id in Array(continuationTimers.keys) { releaseContinuation(id) }
+    }
+
+    private func queueTranslation(_ id: UUID) {
+        guard let service = apis?.translation else { return }
+        translationQueue.append(TranslationJob(id: id, service: service))
+        startQueuedTranslations()
     }
 
     private func publishOriginal() {
@@ -797,7 +899,7 @@ final class ClassroomSession: ObservableObject {
             let id = job.id
             guard let index = indices[id] else { continue }
             let original = captions[index].original
-            let previous = captions[..<index].last { $0.originalFinal && !$0.original.isEmpty }?.original
+            let previous = captions[..<index].last { $0.originalFinal && !$0.mergedIntoPrevious && !$0.original.isEmpty }?.original
             let language = captions[index].translationLanguage
             if captions[index].translationFailed {
                 captions[index].translation = ""
@@ -823,6 +925,7 @@ final class ClassroomSession: ObservableObject {
                     if let index = indices[id] {
                         captions[index].translation = text
                         captions[index].translationFinal = true
+                        storedPositions.remove(captions[index].position)
                     }
                 } catch {
                     translationDeltas.removeValue(forKey: id)
@@ -830,6 +933,7 @@ final class ClassroomSession: ObservableObject {
                         AppLog.failure("translation.failed", error)
                         captions[index].translation = ""
                         captions[index].translationFailed = true
+                        storedPositions.remove(captions[index].position)
                         notice = description(for: error)
                     }
                 }
@@ -838,12 +942,111 @@ final class ClassroomSession: ObservableObject {
     }
 
     private func cancelTranslations() {
+        for timer in continuationTimers.values { timer.cancel() }
+        continuationTimers.removeAll()
         for worker in workers.values { worker.cancel() }
         workers.removeAll()
         translationQueue.removeAll()
         translationDeltas.removeAll()
         translationRefresh?.cancel()
         translationRefresh = nil
+    }
+
+    private func startArchiveTimer() {
+        archiveTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(2)) }
+                catch { return }
+                guard let self else { return }
+                self.updateVisibleRange()
+                await self.persistCaptions(evictOld: true)
+            }
+        }
+    }
+
+    private func updateVisibleRange() {
+        let cutoff = max(0, recordingClock.elapsed().components.seconds - TranscriptArchive.visibleSeconds)
+        if cutoff != visibleSince { visibleSince = cutoff }
+    }
+
+    private func persistCaptions(evictOld: Bool) async {
+        guard let archive = transcriptArchive else { return }
+        let writeNotice = "暂时无法写入字幕归档。原文和译文仍保留，App 会重试。"
+        let cutoff = visibleSince
+        let entries: [TranscriptArchive.Entry] = captions.compactMap { caption in
+            guard !storedPositions.contains(caption.position), caption.translationFinal || caption.translationFailed,
+                  let body = TextExport.block(caption) else { return nil }
+            return .init(id: caption.position, text: body)
+        }
+        do {
+            if !entries.isEmpty {
+                try await Task.detached(priority: .utility) { try archive.write(entries) }.value
+                hasArchivedCaptions = true
+                let written = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0.text) })
+                for caption in captions where caption.translationFinal || caption.translationFailed {
+                    if let body = written[caption.position], body == TextExport.block(caption) {
+                        storedPositions.insert(caption.position)
+                    }
+                }
+                if notice == writeNotice { notice = nil }
+            }
+        } catch {
+            AppLog.failure("transcript.archive.write_failed", error)
+            notice = writeNotice
+            return
+        }
+        guard evictOld, cutoff > 0 else { return }
+        let context = captions.last {
+            ($0.recordingStartSeconds ?? .max) < cutoff && $0.originalFinal &&
+                !$0.mergedIntoPrevious && !$0.original.isEmpty
+        }?.id
+        let old = captions.filter { caption in
+            guard caption.id != context, let seconds = caption.recordingStartSeconds, seconds < cutoff else { return false }
+            return caption.mergedIntoPrevious || (caption.originalFinal && caption.original.isEmpty) ||
+                (caption.translationFinal && storedPositions.contains(caption.position))
+        }
+        guard !old.isEmpty else { return }
+        let removed = Set(old.map(\.id))
+        captions.removeAll { removed.contains($0.id) }
+        indices = Dictionary(uniqueKeysWithValues: captions.enumerated().map { ($1.id, $0) })
+        storedPositions.subtract(old.map(\.position))
+    }
+
+    private func recentEntries() -> [TranscriptArchive.Entry] {
+        captions.compactMap { caption in
+            TextExport.block(caption).map { .init(id: caption.position, text: $0) }
+        }
+    }
+
+    func completeTranscript() -> Task<String, Error> {
+        let recent = recentEntries()
+        let archive = hasArchivedCaptions ? transcriptArchive : nil
+        return Task.detached(priority: .utility) {
+            try TranscriptArchive.render(archived: archive?.read() ?? [], recent: recent)
+        }
+    }
+
+    func historyPage(before: Int) async throws -> [TranscriptArchive.Entry] {
+        let limit = TranscriptArchive.pageSize + 1
+        let recent = captions.reversed().lazy.filter { $0.position < before }.compactMap { caption in
+            TextExport.block(caption).map { TranscriptArchive.Entry(id: caption.position, text: $0) }
+        }.prefix(limit)
+        let snapshot = Array(recent)
+        let archive = hasArchivedCaptions ? transcriptArchive : nil
+        return try await Task.detached(priority: .utility) {
+            let stored = try archive?.read(before: before, limit: limit) ?? []
+            var entries = Dictionary(uniqueKeysWithValues: stored.map { ($0.id, $0) })
+            for entry in snapshot { entries[entry.id] = entry }
+            return Array(entries.values.sorted { $0.id > $1.id }.prefix(limit))
+        }.value
+    }
+
+    func discardSavedArchive() {
+        if archiveSaved { transcriptArchive?.discard() }
+    }
+
+    func markTranscriptExported(historyID: UUID) {
+        if self.historyID == historyID { archiveSaved = true }
     }
 
     private func recoverable(_ error: Error) -> Bool {

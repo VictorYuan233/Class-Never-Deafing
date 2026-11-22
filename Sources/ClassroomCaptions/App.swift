@@ -31,7 +31,29 @@ struct ClassroomCaptionsApp {
         let application = NSApplication.shared
         let delegate = AppController()
         application.delegate = delegate
-        application.setActivationPolicy(.accessory)
+        application.setActivationPolicy(.regular)
+        let menu = NSMenu()
+        let root = NSMenuItem()
+        let appMenu = NSMenu(title: AppMetadata.name)
+        let settings = appMenu.addItem(withTitle: "设置…", action: #selector(AppController.openSettings), keyEquivalent: ",")
+        settings.target = delegate
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "退出 \(AppMetadata.name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        root.submenu = appMenu
+        menu.addItem(root)
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "编辑")
+        edit.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        menu.addItem(editItem)
+        application.mainMenu = menu
         withExtendedLifetime(delegate) { application.run() }
     }
 }
@@ -138,7 +160,7 @@ final class Preferences: ObservableObject {
     @Published var customTranslationModelID = UserDefaults.standard.string(forKey: "customTranslationModelID") ?? "" {
         didSet { UserDefaults.standard.set(customTranslationModelID, forKey: "customTranslationModelID") }
     }
-    @Published var fastTranslation = UserDefaults.standard.bool(forKey: "fastTranslation") {
+    @Published var fastTranslation = UserDefaults.standard.object(forKey: "fastTranslation") as? Bool ?? false {
         didSet { UserDefaults.standard.set(fastTranslation, forKey: "fastTranslation") }
     }
 
@@ -226,10 +248,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var panel: CaptionPanel?
     private var settings: NSWindow?
     private var guideWindow: NSWindow?
+    private var historyWindow: NSWindow?
     private var subscriptions = Set<AnyCancellable>()
     private var audioDevicesListener: AudioObjectPropertyListenerBlock?
     private var waitingToQuit = false
     private var sessionSavePanel: NSSavePanel?
+    private var exportingTranscript = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         session.translationForRetry = { [weak self] in
@@ -318,6 +342,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        session.discardSavedArchive()
         AppLog.event("app.quit")
         shortcuts.shutdown()
         if let audioDevicesListener {
@@ -344,6 +369,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         folderItem.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
         menu.addItem(folderItem)
         menu.addItem(item("另存本节课文本…", #selector(save), enabled: session.canExport))
+        menu.addItem(item("查看本节课历史", #selector(showHistory), enabled: session.hasHistory))
         menu.addItem(.separator())
         menu.addItem(selectionMenu("输入源", values: preferences.audioChoices.map { ($0.id, $0.label) },
                                    chosen: preferences.audioInputID, action: #selector(pickAudioInput(_:))))
@@ -397,7 +423,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     @objc func begin() {
-        guard session.phase == .idle else { return }
+        guard session.phase == .idle, !exportingTranscript else { return }
         showPanel()
         session.start(
             source: .source(preferences.sourceID), target: .target(preferences.targetID),
@@ -570,7 +596,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
-    @objc private func openSettings() {
+    @objc fileprivate func openSettings() {
         preferences.refreshAudioInputs()
         if settings == nil {
             let window = NSWindow(
@@ -690,8 +716,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     @objc private func save() {
-        guard session.canExport else { return }
-        let content = TextExport.render(session.captions)
+        guard session.canExport, !exportingTranscript else { return }
+        let historyID = session.historyID
         let dialog = NSSavePanel()
         dialog.allowedContentTypes = [.plainText]
         dialog.canCreateDirectories = true
@@ -703,17 +729,41 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         dialog.nameFieldStringValue = "课堂字幕-\(date.string(from: Date())).txt"
         NSApp.activate(ignoringOtherApps: true)
         guard dialog.runModal() == .OK, let url = dialog.url else { return }
-        do {
-            try PrivateDataLocation.check(url.deletingLastPathComponent())
-            try PrivateDataLocation.check(url)
-            try content.write(to: url, atomically: true, encoding: .utf8)
-            let alert = NSAlert()
-            alert.messageText = "课堂文本已保存"
-            alert.informativeText = url.lastPathComponent
-            alert.runModal()
-        } catch {
-            showError(error)
+        exportingTranscript = true
+        let transcript = session.completeTranscript()
+        Task {
+            defer { exportingTranscript = false }
+            do {
+                let content = try await transcript.value
+                try await Task.detached(priority: .utility) {
+                    try PrivateDataLocation.check(url.deletingLastPathComponent())
+                    try PrivateDataLocation.check(url)
+                    try content.write(to: url, atomically: true, encoding: .utf8)
+                }.value
+                session.markTranscriptExported(historyID: historyID)
+                let alert = NSAlert()
+                alert.messageText = "课堂文本已保存"
+                alert.informativeText = url.lastPathComponent
+                alert.runModal()
+            } catch {
+                showError(error)
+            }
         }
+    }
+
+    @objc private func showHistory() {
+        guard session.hasHistory else { return }
+        if historyWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 500),
+                                  styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            window.title = "本节课历史"
+            window.isReleasedWhenClosed = false
+            window.center()
+            historyWindow = window
+        }
+        historyWindow?.contentView = NSHostingView(rootView: TranscriptHistoryView(session: session))
+        NSApp.activate(ignoringOtherApps: true)
+        historyWindow?.makeKeyAndOrderFront(nil)
     }
 
     private func showError(_ error: Error) {
