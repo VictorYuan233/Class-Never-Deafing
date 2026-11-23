@@ -86,6 +86,7 @@ struct CaptionView: View {
     let stopAndSaveAs: () -> Void
 
     private var foreground: Color { preferences.panelForeground }
+    private var languageShadow: Color { foreground == .black ? .black.opacity(0.65) : .clear }
     private var originalColor: Color { preferences.originalTypography.color?.swiftUIColor ?? foreground.opacity(0.80) }
     private var translationColor: Color { preferences.translationTypography.color?.swiftUIColor ?? foreground }
 
@@ -149,6 +150,8 @@ struct CaptionView: View {
             languageMenu("源语言", values: Language.sources, selection: $preferences.sourceID, compact: compact)
             Image(systemName: "arrow.right")
                 .font(.system(size: 9))
+                .foregroundStyle(.white)
+                .shadow(color: languageShadow, radius: 1.6, y: 1)
                 .accessibilityHidden(true)
             languageMenu("目标语言", values: Language.targets, selection: $preferences.targetID, compact: compact)
             Spacer(minLength: compact ? 2 : 6)
@@ -227,19 +230,32 @@ struct CaptionView: View {
         case .traditional: compact ? "繁中" : "繁体中文"
         default: language.label
         }
-        return Menu {
-            Picker(title, selection: selection) {
-                ForEach(values) { Text($0.label).tag($0.id) }
-            }
-        } label: {
+        return HStack(spacing: 4) {
             Text(shortLabel).lineLimit(1)
+            if !compact {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(compact ? .hidden : .visible)
+        .foregroundStyle(.white)
+        .shadow(color: languageShadow, radius: 1.6, y: 1)
         .fixedSize()
-        .accessibilityLabel(title)
-        .accessibilityValue(language.label)
-        .help(title)
+        .accessibilityHidden(true)
+        // AppKit applies the system text color to borderless menu labels.
+        .overlay {
+            Menu {
+                Picker(title, selection: selection) {
+                    ForEach(values) { Text($0.label).tag($0.id) }
+                }
+            } label: {
+                Color.clear.contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .accessibilityLabel(title)
+            .accessibilityValue(language.label)
+            .help(title)
+        }
     }
 
     private var originalFont: Font { preferences.originalTypography.font(defaultWeight: .regular) }

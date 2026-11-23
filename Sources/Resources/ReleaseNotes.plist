@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.0.8</string>
+    <string>1.0.9</string>
     <key>highlights</key>
     <array>
-        <string>添加回听标记时，小旗短暂变黄，随后恢复原样。</string>
+        <string>字幕窗顶部的源语言、目标语言和下拉箭头统一为白色。</string>
     </array>
 </dict>
 </plist>
