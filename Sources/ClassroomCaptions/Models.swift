@@ -31,43 +31,213 @@ struct Language: Identifiable, Equatable {
 
 struct Caption: Identifiable {
     let id = UUID()
+    var position = 0
     var recordingStartSeconds: Int64?
     var original = ""
     var translation = ""
     var originalFinal = false
     var translationFinal = false
+    var translationIsDraft = false
     var originalFailed = false
     var translationFailed = false
     var translationLanguage = Language.simplified
+    var originalLanguage = Language.automatic
+    var captureID: UUID?
 
-    static func visibleRows(_ captions: [Caption], drafts: [UUID: String]) -> [Caption] {
+    static func visibleRows(_ captions: [Caption]) -> [Caption] {
         var lastRowWasFailure = false
-        return captions.compactMap { caption in
-            var row = caption
-            if row.original.isEmpty, let text = drafts[row.id] { row.original = text }
-            if !row.original.isEmpty {
+        return captions.filter { caption in
+            if !caption.original.isEmpty {
                 lastRowWasFailure = false
-                return row
+                return true
             }
-            guard row.originalFailed, !lastRowWasFailure else { return nil }
+            guard caption.originalFailed, !lastRowWasFailure else { return false }
             lastRowWasFailure = true
-            return row
+            return true
         }
     }
 }
 
+struct LiveCaption: Identifiable, Equatable {
+    let id: Int
+    let original: String
+    let translation: String
+}
+
+struct DraftTranslation {
+    let original: String
+    let target: Language
+    let fallback: String
+    var text = ""
+    var completed = false
+
+    var displayedText: String { text.isEmpty ? fallback : text }
+
+    func matches(_ text: String, target: Language) -> Bool {
+        self.target == target && original == text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    func coversStart(of text: String, target: Language) -> Bool {
+        guard self.target == target else { return false }
+        let normalized = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return normalized.hasPrefix(original) || original.commonPrefix(with: normalized).count >= 12
+    }
+}
+
+struct SentenceBatcher {
+    static let counts = 1...5
+    static let defaultCount = 1
+
+    struct Batch {
+        let text: String
+        let startSeconds: Int64?
+    }
+
+    private struct Fragment {
+        var offset: Int
+        let startSeconds: Int64?
+    }
+
+    private(set) var text = ""
+    private var fragments: [Fragment] = []
+    var startSeconds: Int64? { fragments.first?.startSeconds }
+
+    private static let punctuation = try! NSRegularExpression(pattern: #"[.!?。！？]+[”’"'»」』）)\]]*"#)
+    private static let unspacedBoundary = try! NSRegularExpression(
+        pattern: #"[\p{Han}\p{Hiragana}\p{Katakana}。！？、，；：」』][\p{Han}\p{Hiragana}\p{Katakana}「『]"#)
+    private static let abbreviation = try! NSRegularExpression(
+        pattern: #"(?i)(?:\b(?:mr|mrs|ms|dr|prof|sr|jr|st|vs|fig|no|e\.g|i\.e)\.|\b(?:[a-z]\.){2,}|\b[A-Z]\.)$"#)
+    private static let unfinishedEnd = try! NSRegularExpression(
+        pattern: #"(?i)\b(?:and|or|but|because|although|unless|whereas|such as|for example|in order to|as a result of|due to|depends on|to|that|of)$"#)
+    private static let subordinateStart = try! NSRegularExpression(
+        pattern: #"(?i)^(?:if|unless|although|even if|even though|whereas|because)\b"#)
+    private static let mainClause = try! NSRegularExpression(
+        pattern: #"(?i)\b(?:then|(?:we|you|they|he|she|it|i)\s+(?:can|could|will|would|should|must|may|might|need to))\b"#)
+
+    mutating func append(_ original: String, at seconds: Int64?, language: Language) {
+        let incoming = original.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = incoming.first else { return }
+        var separator = Self.separator(after: text.last, before: first)
+        if !text.isEmpty {
+            let lastComplete = Self.sentenceEnds(in: text, language: language).last ?? text.startIndex
+            let tail = text[lastComplete...]
+            if text.hasSuffix("."), Self.incomplete(tail.dropLast(), language: language), first.isASCII {
+                separator = Self.matches(Self.unfinishedEnd, in: String(tail.dropLast())) ? " " : ", "
+                text.removeLast()
+            }
+            text += separator
+        }
+        fragments.append(Fragment(offset: text.count, startSeconds: seconds))
+        text += incoming
+    }
+
+    mutating func take(count: Int, language: Language) -> Batch? {
+        let ends = Self.sentenceEnds(in: text, language: language)
+        guard count > 0, ends.count >= count else { return nil }
+        return consume(through: ends[count - 1])
+    }
+
+    mutating func flush() -> Batch? {
+        consume(through: text.endIndex)
+    }
+
+    static func separator(after last: Character?, before first: Character) -> String {
+        guard let last, !matches(unspacedBoundary, in: "\(last)\(first)") else { return "" }
+        return " "
+    }
+
+    static func previewParagraphs(_ text: String, count: Int, language: Language) -> [String] {
+        guard !text.isEmpty, count > 0 else { return [] }
+        let ends = sentenceEnds(in: text, language: language)
+        var paragraphs: [String] = []
+        var start = text.startIndex
+        for index in stride(from: count - 1, to: ends.count, by: count) {
+            let end = ends[index]
+            paragraphs.append(String(text[start..<end]))
+            start = text[end...].drop(while: \.isWhitespace).startIndex
+        }
+        if start != text.endIndex {
+            paragraphs.append(String(text[start...]))
+        }
+        return paragraphs
+    }
+
+    private mutating func consume(through end: String.Index) -> Batch? {
+        guard end != text.startIndex else { return nil }
+        let batch = Batch(text: String(text[..<end]).trimmingCharacters(in: .whitespaces), startSeconds: startSeconds)
+        // A surviving tail keeps the timestamp of the audio fragment where it began.
+        let remainder = text[end...].drop(while: \.isWhitespace)
+        let removed = text.distance(from: text.startIndex, to: remainder.startIndex)
+        if remainder.isEmpty {
+            self = .init()
+        } else {
+            while fragments.count > 1, fragments[1].offset <= removed { fragments.removeFirst() }
+            for index in fragments.indices { fragments[index].offset = max(0, fragments[index].offset - removed) }
+            text = String(remainder)
+        }
+        return batch
+    }
+
+    private static func sentenceEnds(in text: String, language: Language) -> [String.Index] {
+        var ends: [String.Index] = []
+        var start = text.startIndex
+        for match in Self.punctuation.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            guard let range = Range(match.range, in: text) else { continue }
+            let mark = text[range.lowerBound]
+            if mark == "." {
+                guard !text[range].hasPrefix(".."),
+                      range.upperBound == text.endIndex || text[range.upperBound].isWhitespace,
+                      !Self.matches(Self.abbreviation, in: String(text[start..<text.index(after: range.lowerBound)])) else {
+                    continue
+                }
+            }
+            guard !Self.incomplete(text[start..<range.lowerBound], language: language) else { continue }
+            ends.append(range.upperBound)
+            start = range.upperBound
+        }
+        return ends
+    }
+
+    private static func incomplete(_ text: Substring, language: Language) -> Bool {
+        guard language == .english || language == .automatic else { return false }
+        let clause = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if matches(unfinishedEnd, in: clause) { return true }
+        return matches(subordinateStart, in: clause) &&
+            clause.rangeOfCharacter(from: CharacterSet(charactersIn: ",;:!?")) == nil &&
+            !matches(mainClause, in: clause.split(whereSeparator: \.isWhitespace).dropFirst(3).joined(separator: " "))
+    }
+
+    private static func matches(_ pattern: NSRegularExpression, in text: String) -> Bool {
+        pattern.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
+    }
+}
+
 struct TranscriptDrafts {
-    struct Draft: Identifiable, Equatable {
+    struct Draft: Equatable {
         let connection: UUID
         let item: String
         var text: String
-
-        var id: String { "\(connection):\(item)" }
     }
 
     struct Snapshot: Equatable {
         var unbound: [Draft] = []
         var bound: [UUID: String] = [:]
+
+        func paragraph(after waiting: String, pending: [Caption]) -> String {
+            var paragraph = ""
+            func append(_ chunk: String) {
+                let text = chunk.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                guard let first = text.first else { return }
+                paragraph += SentenceBatcher.separator(after: paragraph.last, before: first)
+                paragraph += text
+            }
+            append(waiting)
+            for caption in pending {
+                append(caption.originalFinal || !caption.original.isEmpty ? caption.original : bound[caption.id] ?? "")
+            }
+            for draft in unbound { append(draft.text) }
+            return paragraph
+        }
     }
 
     private var unbound: [Draft] = []
@@ -127,16 +297,6 @@ enum SegmentationLength: Int, CaseIterable {
         let maximumFrames: Int
     }
 
-    var title: String {
-        switch self {
-        case .short: "短"
-        case .standard: "标准"
-        case .longer: "偏长"
-        case .long: "长"
-        case .extended: "最长"
-        }
-    }
-
     var limits: Limits {
         switch self {
         case .short: .init(pauseFrames: 30, longTurnPauseFrames: 16, longTurnFrames: 260, maximumFrames: 400)
@@ -145,13 +305,6 @@ enum SegmentationLength: Int, CaseIterable {
         case .long: .init(pauseFrames: 70, longTurnPauseFrames: 34, longTurnFrames: 720, maximumFrames: 1100)
         case .extended: .init(pauseFrames: 75, longTurnPauseFrames: 75, longTurnFrames: 1500, maximumFrames: 1500)
         }
-    }
-
-    var detail: String {
-        let timing = limits
-        let pause = Double(timing.pauseFrames) / 50
-        let maximum = timing.maximumFrames / 50
-        return "\(title) · 停顿约 \(pause.formatted(.number.precision(.fractionLength(1...2)))) 秒 · 每段最长 \(maximum) 秒"
     }
 }
 
@@ -172,7 +325,7 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
 
     var help: String {
         switch self {
-        case .live: "通过 Realtime 接口边听边显示原文。"
+        case .live: "通过 Realtime 接口边听边显示原文，使用 minimal 延迟模式。"
         case .committed: "通过 Realtime 接口，在每段音频提交后返回原文。"
         case .custom: "每段结束后通过服务商的 /audio/transcriptions 接口转写。"
         }
@@ -270,6 +423,103 @@ struct CaptionRGB: Codable, Equatable {
     let red: Double
     let green: Double
     let blue: Double
+}
+
+extension CaptionRGB {
+    init(rgb: UInt32) {
+        self.init(red: Double((rgb >> 16) & 255) / 255,
+                  green: Double((rgb >> 8) & 255) / 255,
+                  blue: Double(rgb & 255) / 255)
+    }
+
+    init?(hex: String) {
+        let input = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let digits = input.hasPrefix("#") ? input.dropFirst() : input[...]
+        guard digits.utf8.count == 6, digits.utf8.allSatisfy({
+            (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+        }), let rgb = UInt32(digits, radix: 16) else { return nil }
+        self.init(rgb: rgb)
+    }
+
+    var hex: String {
+        func byte(_ value: Double) -> Int {
+            guard value.isFinite else { return 0 }
+            return Int((min(max(value, 0), 1) * 255).rounded())
+        }
+        return String(format: "#%02X%02X%02X", byte(red), byte(green), byte(blue))
+    }
+}
+
+enum CaptionColorChoice: String, Codable, CaseIterable, Identifiable {
+    case automatic, white, black, silver, blue, green, red, gold
+    case originalGray, deepGray, mistBlue, lavender, sand, sage, custom
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .automatic: "自动"
+        case .white: "白色"
+        case .black: "黑色"
+        case .silver: "银灰"
+        case .blue: "经典蓝"
+        case .green: "经典绿"
+        case .red: "经典红"
+        case .gold: "金黄"
+        case .originalGray: "同原文灰"
+        case .deepGray: "深一档灰"
+        case .mistBlue: "雾蓝灰"
+        case .lavender: "薰衣草灰"
+        case .sand: "暖沙灰"
+        case .sage: "鼠尾草灰"
+        case .custom: "自定义颜色"
+        }
+    }
+
+    var rgb: CaptionRGB? {
+        let value: UInt32
+        switch self {
+        case .white: value = 0xFFFFFF
+        case .black: value = 0x000000
+        case .silver: value = 0xD6DAE0
+        case .blue: value = 0x68A9FF
+        case .green: value = 0x7BD88F
+        case .red: value = 0xFF8585
+        case .gold: value = 0xFFD36E
+        case .deepGray: value = 0xB9BDC4
+        case .mistBlue: value = 0xB5C9DE
+        case .lavender: value = 0xC9BDDB
+        case .sand: value = 0xD5C6B0
+        case .sage: value = 0xBBCFBE
+        case .automatic, .originalGray, .custom: return nil
+        }
+        return CaptionRGB(rgb: value)
+    }
+}
+
+struct CaptionColorSetting: Codable, Equatable {
+    var choice: CaptionColorChoice = .automatic
+    var customColor: CaptionRGB?
+
+    init(choice: CaptionColorChoice = .automatic, customColor: CaptionRGB? = nil) {
+        self.choice = choice
+        self.customColor = customColor
+    }
+
+    init(legacyColor: CaptionRGB?) {
+        self.init(choice: legacyColor == nil ? .automatic : .custom, customColor: legacyColor)
+    }
+}
+
+struct CaptionColors: Codable, Equatable {
+    var original: CaptionColorSetting
+    var draft = CaptionColorSetting(choice: .mistBlue)
+    var final: CaptionColorSetting
+
+    init(originalColor: CaptionRGB? = nil, finalColor: CaptionRGB? = nil) {
+        original = CaptionColorSetting(legacyColor: originalColor)
+        final = CaptionColorSetting(legacyColor: finalColor)
+    }
 }
 
 struct CaptionScrollFollow {
@@ -455,21 +705,56 @@ enum ExportArchive {
     }
 }
 
+struct RecordingMarker: Equatable {
+    let number: Int
+    let seconds: Int64
+
+    var line: String { "[\(RecordingClock.format(seconds: seconds))] 标记 \(number)" }
+}
+
 enum TextExport {
     static var automaticFolder: URL {
         URL.applicationSupportDirectory.appending(path: "课堂字幕/课堂记录", directoryHint: .isDirectory)
     }
 
     static func render(_ captions: [Caption]) -> String {
-        let blocks = captions.compactMap { caption -> String? in
-            let original = line(caption.original)
-            guard caption.originalFinal, !original.isEmpty else { return nil }
-            let translation = line(caption.translation)
-            let target = caption.translationFinal && !translation.isEmpty ? translation : "[翻译未完成]"
-            let timestamp = caption.recordingStartSeconds.map { "[\(RecordingClock.format(seconds: $0))] " } ?? ""
-            return timestamp + original + "\n" + target
+        assemble(captions.compactMap(block), markers: [])
+    }
+
+    static func assemble(_ blocks: [String], markers: [RecordingMarker]) -> String {
+        guard !markers.isEmpty else { return blocks.isEmpty ? "" : blocks.joined(separator: "\n\n") + "\n" }
+        let index = "回听标记\n" + markers.map(\.line).joined(separator: "\n")
+        var output = [index]
+        var remaining = markers[...]
+        for block in blocks {
+            if let time = blockTimestamp(block) {
+                while let marker = remaining.first, marker.seconds < time {
+                    output.append(marker.line)
+                    remaining.removeFirst()
+                }
+            }
+            output.append(block)
         }
-        return blocks.isEmpty ? "" : blocks.joined(separator: "\n\n") + "\n"
+        output.append(contentsOf: remaining.map(\.line))
+        return output.joined(separator: "\n\n") + "\n"
+    }
+
+    private static func blockTimestamp(_ block: String) -> Int64? {
+        guard block.first == "[", let end = block.firstIndex(of: "]") else { return nil }
+        let parts = block[block.index(after: block.startIndex)..<end].split(separator: ":")
+        guard parts.count == 3, let hours = Int64(parts[0]), let minutes = Int64(parts[1]),
+              let seconds = Int64(parts[2]), (0...9999).contains(hours),
+              (0..<60).contains(minutes), (0..<60).contains(seconds) else { return nil }
+        return hours * 3600 + minutes * 60 + seconds
+    }
+
+    static func block(_ caption: Caption) -> String? {
+        let original = line(caption.original)
+        guard caption.originalFinal, !original.isEmpty else { return nil }
+        let translation = line(caption.translation)
+        let target = caption.translationFinal && !translation.isEmpty ? translation : "[翻译未完成]"
+        let timestamp = caption.recordingStartSeconds.map { "[\(RecordingClock.format(seconds: $0))] " } ?? ""
+        return timestamp + original + "\n" + target
     }
 
     static func saveAutomatically(_ content: String, to destination: SessionExport) throws -> URL {

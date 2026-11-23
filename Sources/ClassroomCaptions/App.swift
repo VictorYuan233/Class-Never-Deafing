@@ -31,7 +31,29 @@ struct ClassroomCaptionsApp {
         let application = NSApplication.shared
         let delegate = AppController()
         application.delegate = delegate
-        application.setActivationPolicy(.accessory)
+        application.setActivationPolicy(.regular)
+        let menu = NSMenu()
+        let root = NSMenuItem()
+        let appMenu = NSMenu(title: AppMetadata.name)
+        let settings = appMenu.addItem(withTitle: "设置…", action: #selector(AppController.openSettings), keyEquivalent: ",")
+        settings.target = delegate
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "退出 \(AppMetadata.name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        root.submenu = appMenu
+        menu.addItem(root)
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "编辑")
+        edit.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = edit.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        menu.addItem(editItem)
+        application.mainMenu = menu
         withExtendedLifetime(delegate) { application.run() }
     }
 }
@@ -52,9 +74,11 @@ final class Preferences: ObservableObject {
     @Published var audioInputID = UserDefaults.standard.string(forKey: "audioInputID") ?? AudioInput.defaultID {
         didSet { UserDefaults.standard.set(audioInputID, forKey: "audioInputID") }
     }
-    @Published var segmentationLength = (UserDefaults.standard.object(forKey: "segmentationLength") as? Int)
-        .flatMap(SegmentationLength.init(rawValue:)) ?? .standard {
-        didSet { UserDefaults.standard.set(segmentationLength.rawValue, forKey: "segmentationLength") }
+    @Published var sentencesPerTranslation = {
+        let saved = UserDefaults.standard.integer(forKey: "sentencesPerTranslation")
+        return SentenceBatcher.counts.contains(saved) ? saved : SentenceBatcher.defaultCount
+    }() {
+        didSet { UserDefaults.standard.set(sentencesPerTranslation, forKey: "sentencesPerTranslation") }
     }
     @Published var silencePauseEnabled = UserDefaults.standard.bool(forKey: "silencePauseEnabled") {
         didSet { UserDefaults.standard.set(silencePauseEnabled, forKey: "silencePauseEnabled") }
@@ -97,6 +121,14 @@ final class Preferences: ObservableObject {
     @Published var translationTypography = Preferences.loadTypography("translationTypography", fallback: .translation) {
         didSet { saveTypography(translationTypography, key: "translationTypography") }
     }
+    private static let captionColorsKey = "captionColors"
+    @Published var captionColors = Preferences.loadCaptionColors() {
+        didSet {
+            if let data = try? JSONEncoder().encode(captionColors) {
+                UserDefaults.standard.set(data, forKey: Self.captionColorsKey)
+            }
+        }
+    }
 
     func refreshAudioInputs() {
         audioInputs = AudioInput.devices()
@@ -107,6 +139,15 @@ final class Preferences: ObservableObject {
               var value = try? JSONDecoder().decode(CaptionTypography.self, from: data) else { return fallback }
         value.size = min(max(value.size, CaptionTypography.sizes.lowerBound), CaptionTypography.sizes.upperBound)
         return value
+    }
+
+    private static func loadCaptionColors() -> CaptionColors {
+        if let data = UserDefaults.standard.data(forKey: captionColorsKey),
+           let colors = try? JSONDecoder().decode(CaptionColors.self, from: data) {
+            return colors
+        }
+        return CaptionColors(originalColor: loadTypography("originalTypography", fallback: .original).color,
+                             finalColor: loadTypography("translationTypography", fallback: .translation).color)
     }
 
     private func saveTypography(_ value: CaptionTypography, key: String) {
@@ -138,7 +179,7 @@ final class Preferences: ObservableObject {
     @Published var customTranslationModelID = UserDefaults.standard.string(forKey: "customTranslationModelID") ?? "" {
         didSet { UserDefaults.standard.set(customTranslationModelID, forKey: "customTranslationModelID") }
     }
-    @Published var fastTranslation = UserDefaults.standard.bool(forKey: "fastTranslation") {
+    @Published var fastTranslation = UserDefaults.standard.object(forKey: "fastTranslation") as? Bool ?? false {
         didSet { UserDefaults.standard.set(fastTranslation, forKey: "fastTranslation") }
     }
 
@@ -226,10 +267,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var panel: CaptionPanel?
     private var settings: NSWindow?
     private var guideWindow: NSWindow?
+    private var historyWindow: NSWindow?
     private var subscriptions = Set<AnyCancellable>()
     private var audioDevicesListener: AudioObjectPropertyListenerBlock?
     private var waitingToQuit = false
     private var sessionSavePanel: NSSavePanel?
+    private var exportingTranscript = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         session.translationForRetry = { [weak self] in
@@ -267,6 +310,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         preferences.$targetID.sink { [weak self] id in
             self?.session.selectTarget(.target(id))
         }.store(in: &subscriptions)
+        preferences.$sentencesPerTranslation.sink { [weak self] count in
+            self?.session.configureSentenceCount(count)
+        }.store(in: &subscriptions)
+        preferences.$translationModel.combineLatest(preferences.$customTranslationModelID, preferences.$fastTranslation)
+            .combineLatest(preferences.$translationAddress, preferences.$translationFormat)
+            .sink { [weak self] selection, address, format in
+                let (model, customID, fast) = selection
+                guard let endpoint = try? APIEndpoint(address),
+                      let config = try? model.configuration(customID: customID, fast: fast) else {
+                    self?.session.configureTranslation(nil)
+                    return
+                }
+                self?.session.configureTranslation(TranslationTuning(endpoint: endpoint, format: format, model: config))
+            }.store(in: &subscriptions)
         preferences.$silencePauseEnabled.combineLatest(preferences.$silencePauseMinutes).sink { [weak self] enabled, minutes in
             self?.session.configureSilencePause(minutes: enabled ? minutes : nil)
         }.store(in: &subscriptions)
@@ -318,6 +375,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        session.discardSavedArchive()
         AppLog.event("app.quit")
         shortcuts.shutdown()
         if let audioDevicesListener {
@@ -344,6 +402,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         folderItem.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
         menu.addItem(folderItem)
         menu.addItem(item("另存本节课文本…", #selector(save), enabled: session.canExport))
+        menu.addItem(item("查看本节课历史", #selector(showHistory), enabled: session.hasHistory))
         menu.addItem(.separator())
         menu.addItem(selectionMenu("输入源", values: preferences.audioChoices.map { ($0.id, $0.label) },
                                    chosen: preferences.audioInputID, action: #selector(pickAudioInput(_:))))
@@ -397,11 +456,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     @objc func begin() {
-        guard session.phase == .idle else { return }
+        guard session.phase == .idle, !exportingTranscript else { return }
         showPanel()
         session.start(
             source: .source(preferences.sourceID), target: .target(preferences.targetID),
-            audioInputID: preferences.audioInputID, segmentationLength: preferences.segmentationLength,
+            audioInputID: preferences.audioInputID,
             automaticSave: preferences.automaticSave, retentionDays: preferences.retentionDays
         ) { [weak self] in
             try await self?.authorizeStart()
@@ -570,7 +629,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
-    @objc private func openSettings() {
+    @objc fileprivate func openSettings() {
         preferences.refreshAudioInputs()
         if settings == nil {
             let window = NSWindow(
@@ -690,8 +749,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     @objc private func save() {
-        guard session.canExport else { return }
-        let content = TextExport.render(session.captions)
+        guard session.canExport, !exportingTranscript else { return }
+        let historyID = session.historyID
         let dialog = NSSavePanel()
         dialog.allowedContentTypes = [.plainText]
         dialog.canCreateDirectories = true
@@ -703,17 +762,41 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         dialog.nameFieldStringValue = "课堂字幕-\(date.string(from: Date())).txt"
         NSApp.activate(ignoringOtherApps: true)
         guard dialog.runModal() == .OK, let url = dialog.url else { return }
-        do {
-            try PrivateDataLocation.check(url.deletingLastPathComponent())
-            try PrivateDataLocation.check(url)
-            try content.write(to: url, atomically: true, encoding: .utf8)
-            let alert = NSAlert()
-            alert.messageText = "课堂文本已保存"
-            alert.informativeText = url.lastPathComponent
-            alert.runModal()
-        } catch {
-            showError(error)
+        exportingTranscript = true
+        let transcript = session.completeTranscript()
+        Task {
+            defer { exportingTranscript = false }
+            do {
+                let content = try await transcript.value
+                try await Task.detached(priority: .utility) {
+                    try PrivateDataLocation.check(url.deletingLastPathComponent())
+                    try PrivateDataLocation.check(url)
+                    try content.write(to: url, atomically: true, encoding: .utf8)
+                }.value
+                session.markTranscriptExported(historyID: historyID)
+                let alert = NSAlert()
+                alert.messageText = "课堂文本已保存"
+                alert.informativeText = url.lastPathComponent
+                alert.runModal()
+            } catch {
+                showError(error)
+            }
         }
+    }
+
+    @objc private func showHistory() {
+        guard session.hasHistory else { return }
+        if historyWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 500),
+                                  styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            window.title = "本节课历史"
+            window.isReleasedWhenClosed = false
+            window.center()
+            historyWindow = window
+        }
+        historyWindow?.contentView = NSHostingView(rootView: TranscriptHistoryView(session: session))
+        NSApp.activate(ignoringOtherApps: true)
+        historyWindow?.makeKeyAndOrderFront(nil)
     }
 
     private func showError(_ error: Error) {

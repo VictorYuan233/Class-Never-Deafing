@@ -9,6 +9,7 @@ struct CoreChecks {
         try checkTranslationConfiguration()
         try checkSubtitleColors()
         try checkAPISettings()
+        try checkLiveTranslationTuning()
         try checkLogRetention()
         checkSpeechBoundaries()
         checkQuietMicrophone()
@@ -18,16 +19,21 @@ struct CoreChecks {
         checkTranscriptionRecoveryRequest()
         checkRecoveryAmplification()
         checkTranscriptDrafts()
+        checkLiveParagraph()
+        checkLiveParagraphBoundaries()
+        checkDraftTranslationMatching()
         checkFailureRows()
         checkSoundActivity()
         try await checkSystemAudioConversion()
         checkCaptionScroll()
         checkRecordingClock()
         try checkExport()
+        checkSentenceBatches()
         try checkPrivateDataLocation()
         try checkExportArchive()
+        try checkTranscriptArchive()
         try await checkSessionRecording()
-        print("通过：独立 API 地址与密钥、密钥加密和错误脱敏、翻译与转写请求、字幕窗快捷键、诊断日志、音频分段、字幕录音配对保存。")
+        print("通过：独立 API 地址与密钥、密钥加密和错误脱敏、翻译与转写请求、字幕窗快捷键、诊断日志、音频分段、整句翻译分组、翻译热更新、回听标记与字幕录音配对保存。")
     }
 
     private static func checkTranscriptDrafts() {
@@ -57,16 +63,76 @@ struct CoreChecks {
         precondition(drafts.snapshot() == TranscriptDrafts.Snapshot())
     }
 
+    private static func checkLiveParagraph() {
+        let connection = UUID()
+        var pending = Caption()
+        var drafts = TranscriptDrafts()
+        let waiting = "The first sentence is ready."
+        drafts.append("The second\nsentence is", connection: connection, item: "next")
+        let expected = "\(waiting) The second sentence is"
+        precondition(drafts.snapshot().paragraph(after: waiting, pending: [pending]) == expected)
+
+        drafts.bind(connection: connection, item: "next", to: pending.id)
+        precondition(drafts.snapshot().paragraph(after: waiting, pending: [pending]) == expected)
+        pending.original = "The second sentence is ready."
+        pending.originalFinal = true
+        drafts.append("The third", connection: connection, item: "tail")
+        precondition(drafts.snapshot().paragraph(after: waiting, pending: [pending]) ==
+            "\(waiting) The second sentence is ready. The third")
+        precondition(drafts.snapshot().paragraph(after: "", pending: []) == "The third")
+
+        pending.original = "还在听"
+        let chinese = TranscriptDrafts.Snapshot()
+        precondition(chinese.paragraph(after: "第一句。", pending: [pending]) == "第一句。还在听")
+    }
+
+    private static func checkLiveParagraphBoundaries() {
+        func paragraphs(_ text: String, count: Int, language: Language = .english) -> [String] {
+            SentenceBatcher.previewParagraphs(text, count: count, language: language)
+        }
+        let spoken = "The first sentence is ready. The second sentence has begun"
+        precondition(paragraphs(spoken, count: 1) ==
+            ["The first sentence is ready.", "The second sentence has begun"])
+        precondition(paragraphs(spoken, count: 2) == [spoken])
+        let continued = spoken + ". The third sentence is"
+        precondition(paragraphs(continued, count: 2) ==
+            [spoken + ".", "The third sentence is"])
+
+        let sentence = "Dr. Tan measured 3.14 hertz."
+        precondition(paragraphs(sentence, count: 1) == [sentence])
+        precondition(paragraphs(sentence + " The next reading", count: 1) ==
+            [sentence, "The next reading"])
+        precondition(paragraphs("Dr. Tan measured 3.", count: 1) == ["Dr. Tan measured 3."])
+        let incomplete = "If the reading rises. we will keep watching"
+        precondition(paragraphs(incomplete, count: 1) == [incomplete])
+        let revised = "The first sentence is ready, and the speaker continues"
+        precondition(paragraphs(revised, count: 1) == [revised])
+        precondition(paragraphs("第一句好了。第二句正在说", count: 1, language: .simplified) == ["第一句好了。", "第二句正在说"])
+    }
+
+    private static func checkDraftTranslationMatching() {
+        var draft = DraftTranslation(original: "The temperature is high.", target: .simplified,
+                                     fallback: "初版")
+        precondition(draft.matches("The temperature\nis high.", target: .simplified))
+        precondition(!draft.matches("The temperature is high.", target: .traditional))
+        precondition(!draft.matches("The temperature is higher.", target: .simplified))
+        precondition(draft.coversStart(of: "The temperature is higher.", target: .simplified))
+        precondition(!draft.coversStart(of: "Snow showers are expected.", target: .simplified))
+        precondition(draft.displayedText == "初版")
+        draft.text = "新译文"
+        precondition(draft.displayedText == "新译文")
+    }
+
     private static func checkFailureRows() {
         let firstFailure = Caption(originalFailed: true)
         let missedAgain = Caption(originalFailed: true)
-        let newSpeech = Caption()
+        var newSpeech = Caption(original: "Still speaking.")
         let nextFailure = Caption(originalFailed: true)
-        let captions = [firstFailure, Caption(), missedAgain, newSpeech, nextFailure, Caption(originalFailed: true)]
-        let rows = Caption.visibleRows(captions, drafts: [newSpeech.id: "Still speaking."])
+        let rows = Caption.visibleRows([firstFailure, Caption(), missedAgain, newSpeech, nextFailure, Caption(originalFailed: true)])
         precondition(rows.map(\.id) == [firstFailure.id, newSpeech.id, nextFailure.id])
         precondition(rows[1].original == "Still speaking." && !rows[1].originalFinal)
-        precondition(Caption.visibleRows(captions, drafts: [:]).map(\.id) == [firstFailure.id])
+        newSpeech.original = ""
+        precondition(Caption.visibleRows([firstFailure, missedAgain, newSpeech, nextFailure]).map(\.id) == [firstFailure.id])
     }
 
     private static func checkSoundActivity() {
@@ -156,7 +222,7 @@ struct CoreChecks {
         precondition(Language.target("zh-tw").instruction.contains("Traditional"))
         let live = transcription(for: .automatic)
         precondition(live["model"] as? String == "gpt-live-transcribe")
-        precondition(live["delay"] as? String == "low")
+        precondition(live["delay"] as? String == "minimal")
         let committed = transcription(for: .english, model: .committed)
         precondition(committed["model"] as? String == "gpt-transcribe")
         precondition(committed["delay"] == nil)
@@ -214,6 +280,22 @@ struct CoreChecks {
         style.color = CaptionRGB(red: 1, green: 0.8, blue: 0.1)
         let restored = try JSONDecoder().decode(CaptionTypography.self, from: JSONEncoder().encode(style))
         precondition(restored == style && CaptionTypography.translation.color == nil)
+
+        let colors = CaptionColors(originalColor: restored.color)
+        precondition(colors.original == CaptionColorSetting(choice: .custom, customColor: style.color))
+        precondition(colors.draft.choice == .mistBlue && colors.draft.choice.rgb?.hex == "#B5C9DE")
+        precondition(colors.final.choice == .automatic)
+        precondition(CaptionColorChoice.sage.rgb?.hex == "#BBCFBE")
+        precondition(CaptionRGB(hex: " #bBcfBe ") == CaptionColorChoice.sage.rgb)
+        precondition(CaptionRGB(hex: "000000")?.hex == "#000000")
+        for invalid in ["#123", "#12345678", "+12345", "#GGCFBE", "0xFF00", "#BB CFBE"] {
+            precondition(CaptionRGB(hex: invalid) == nil)
+        }
+        var custom = colors
+        custom.draft = CaptionColorSetting(choice: .custom, customColor: CaptionRGB(hex: "#BBCFBE"))
+        custom.final.choice = .white
+        let saved = try JSONDecoder().decode(CaptionColors.self, from: JSONEncoder().encode(custom))
+        precondition(saved == custom && saved.original.customColor == style.color)
     }
 
     private static func checkSpeechBoundaries() {
@@ -325,17 +407,20 @@ struct CoreChecks {
         let boundary = start.advanced(by: .milliseconds(200))
         yielded += batcher.append(.commit(SpeechBoundary(voicedFrames: 10, silentFrames: 3)), now: boundary)
         yielded += batcher.append(.audio(next), now: boundary.advanced(by: .milliseconds(20)))
-        precondition(yielded.count == 6)
+        precondition(yielded.count == 8)
         var beforeCommit = Data()
-        for packet in yielded.prefix(4) {
+        var sizes: [Int] = []
+        for packet in yielded.prefix(6) {
             guard case .audio(let chunk) = packet.event else { preconditionFailure("Audio order changed") }
             beforeCommit.append(chunk)
+            sizes.append(chunk.count)
         }
+        precondition(sizes == [first.count, 2 * frameSize, 2 * frameSize, 2 * frameSize, 2 * frameSize, frameSize])
         precondition(beforeCommit == first + Data(repeating: 2, count: frameSize * 9))
         precondition(yielded[1].queuedAt == start.advanced(by: .milliseconds(20)))
-        guard case .commit(let signal) = yielded[4].event else { preconditionFailure("Expected segment boundary") }
-        precondition(signal.voicedFrames == 10 && signal.silentFrames == 3 && yielded[4].queuedAt == boundary)
-        guard case .audio(let afterCommit) = yielded[5].event else { preconditionFailure("Next turn must start immediately") }
+        guard case .commit(let signal) = yielded[6].event else { preconditionFailure("Expected segment boundary") }
+        precondition(signal.voicedFrames == 10 && signal.silentFrames == 3 && yielded[6].queuedAt == boundary)
+        guard case .audio(let afterCommit) = yielded[7].event else { preconditionFailure("Next turn must start immediately") }
         precondition(afterCommit == next)
     }
 
@@ -503,6 +588,63 @@ struct CoreChecks {
         }
     }
 
+    private static func checkSentenceBatches() {
+        let english = Language.english
+        var batcher = SentenceBatcher()
+        batcher.append("If interest rates stay high.", at: 12, language: english)
+        precondition(batcher.take(count: 1, language: english) == nil)
+        batcher.append("companies may delay investment. Dr. Tan reviews the U.S. data at 3.14. We also", at: 14, language: english)
+        precondition(batcher.take(count: 5, language: english) == nil)
+        let first = batcher.take(count: 2, language: english)
+        precondition(first?.text == "If interest rates stay high, companies may delay investment. Dr. Tan reviews the U.S. data at 3.14.")
+        precondition(first?.startSeconds == 12 && batcher.text == "We also" && batcher.startSeconds == 14)
+        batcher.append("consider inflation. Ready?", at: 18, language: english)
+        let second = batcher.take(count: 1, language: english)
+        precondition(second?.text == "We also consider inflation." && second?.startSeconds == 14)
+        precondition(batcher.take(count: 1, language: english)?.startSeconds == 18 && batcher.text.isEmpty)
+
+        batcher.append("The method works because.", at: 25, language: .automatic)
+        precondition(batcher.take(count: 1, language: .automatic) == nil)
+        batcher.append("it is faster.", at: 27, language: .automatic)
+        precondition(batcher.take(count: 1, language: .automatic)?.text == "The method works because it is faster.")
+
+        batcher.append("准备好了", at: 30, language: .simplified)
+        batcher.append("吗？可以了。继续讲", at: 31, language: .simplified)
+        precondition(batcher.take(count: 5, language: .simplified) == nil)
+        precondition(batcher.take(count: 2, language: .simplified)?.text == "准备好了吗？可以了。")
+        precondition(batcher.flush()?.text == "继续讲" && batcher.flush() == nil)
+
+        let french = Language.source("fr")
+        batcher.append("Le café", at: 40, language: french)
+        batcher.append("était bon.", at: 41, language: french)
+        precondition(batcher.take(count: 1, language: french)?.text == "Le café était bon.")
+
+        batcher.append("One sentence is ready.", at: 60, language: english)
+        batcher.append("The rest is still in progress", at: 93, language: english)
+        precondition(batcher.take(count: 2, language: english) == nil)
+        precondition(batcher.flush()?.text == "One sentence is ready. The rest is still in progress")
+    }
+
+    private static func checkLiveTranslationTuning() throws {
+        let activeEndpoint = try APIEndpoint("https://example.invalid/v1")
+        let newEndpoint = try APIEndpoint("https://new.example.invalid/v1")
+        let connection = APIConnection(endpoint: activeEndpoint, key: "fixture")
+        let initial = try TranslationModel.luna.configuration()
+        let next = try TranslationModel.sol.configuration(fast: true)
+        let service = TranslationService(connection: connection, format: .responses, model: initial)
+        let optedIn = service.applying(TranslationTuning(endpoint: activeEndpoint, format: .responses, model: next))
+        precondition(service.model == initial && optedIn.model == next && optedIn.model.serviceTier == "fast")
+        precondition(optedIn.connection.endpoint == activeEndpoint && optedIn.connection.key == "fixture" && optedIn.format == .responses)
+
+        let wrongRoute = TranslationTuning(endpoint: newEndpoint, format: .responses, model: initial)
+        let wrongFormat = TranslationTuning(endpoint: activeEndpoint, format: .chat, model: initial)
+        precondition(optedIn.applying(nil).model == next)
+        precondition(optedIn.applying(wrongRoute).model == next && optedIn.applying(wrongFormat).model == next)
+        let custom = try TranslationModel.custom.configuration(customID: "provider/model")
+        let optedOut = optedIn.applying(TranslationTuning(endpoint: activeEndpoint, format: .responses, model: custom))
+        precondition(optedOut.model.id == "provider/model" && optedOut.model.serviceTier == nil)
+    }
+
     private static func checkExportArchive() throws {
         let fm = FileManager.default
         let folder = fm.temporaryDirectory.appending(path: UUID().uuidString)
@@ -539,6 +681,45 @@ struct CoreChecks {
         }
     }
 
+    private static func checkTranscriptArchive() throws {
+        let folder = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let archive = TranscriptArchive(name: "class-fixture", folder: folder)
+        let hours = 3.5
+        let intervals = Int(hours * 3600) / 5
+        let entries = (0..<intervals).map { index in
+            let caption = Caption(position: index, recordingStartSeconds: Int64(index * 5),
+                                  original: "Caption number \(index).", translation: "字幕 \(index)。",
+                                  originalFinal: true, translationFinal: true)
+            return TranscriptArchive.Entry(id: index, text: TextExport.block(caption)!)
+        }
+        precondition(TranscriptArchive.visibleSeconds == 1200)
+        for offset in stride(from: 0, to: intervals, by: 49) {
+            try archive.write(Array(entries[offset..<min(offset + 49, intervals)]))
+        }
+        try archive.write([entries[0]])
+        let first = try archive.read(limit: TranscriptArchive.pageSize)
+        let second = try archive.read(before: first.last!.id, limit: TranscriptArchive.pageSize)
+        precondition(first.first?.id == intervals - 1 && second.first?.id == intervals - 101)
+        let archived = try archive.read()
+        precondition(archived.count == intervals)
+        let revised = TranscriptArchive.Entry(id: intervals - 1, text: "[03:29:55] Final caption.\n结尾。")
+        let output = TranscriptArchive.render(archived: archived, recent: [revised])
+        precondition(output.hasPrefix("[00:00:00] Caption number 0.") && output.hasSuffix("Final caption.\n结尾。\n"))
+        precondition(output.components(separatedBy: "\n\n").count == intervals)
+        let marks = [RecordingMarker(number: 1, seconds: 2), RecordingMarker(number: 2, seconds: 2),
+                     RecordingMarker(number: 3, seconds: 12600)]
+        let marked = TranscriptArchive.render(archived: archived, recent: [revised], markers: marks)
+        precondition(marked.hasPrefix("回听标记\n[00:00:02] 标记 1\n[00:00:02] 标记 2\n[03:30:00] 标记 3"))
+        precondition(marked.contains("字幕 0。\n\n[00:00:02] 标记 1\n\n[00:00:02] 标记 2\n\n[00:00:05] Caption number 1."))
+        precondition(marked.hasSuffix("结尾。\n\n[03:30:00] 标记 3\n"))
+        precondition(TranscriptArchive.render(archived: [], recent: [], markers: [marks[0]])
+            .contains("[00:00:02] 标记 1\n"))
+        archive.discard()
+        precondition(!FileManager.default.fileExists(atPath: archive.url.path))
+        precondition((try? archive.read()) == nil)
+    }
+
     private static func checkSessionRecording() async throws {
         let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -565,12 +746,14 @@ struct CoreChecks {
 
         // Two captures model pause and resume. The recording includes audio before the speech gate.
         let silentPackets = try await capture(0, frames: 28_800, using: recording)
+        precondition(recording.elapsedSeconds == 1)
         let speechPackets = try await capture(1200, using: recording)
         precondition(silentPackets.isEmpty)
-        precondition(speechPackets.compactMap(\.recordingStartSeconds) == [1])
+        precondition(speechPackets.compactMap(\.recordingSeconds) == [1])
+        precondition(recording.elapsedSeconds == 1)
         let outcome = await recording.finish(to: destination)
         guard let url = outcome.url, outcome.warning == nil else { preconditionFailure("Recording did not save") }
-        let caption = Caption(recordingStartSeconds: speechPackets.first?.recordingStartSeconds,
+        let caption = Caption(recordingStartSeconds: speechPackets.first?.recordingSeconds,
                               original: "Hello.", translation: "你好。", originalFinal: true, translationFinal: true)
         let content = TextExport.render([caption])
         precondition(content == "[00:00:01] Hello.\n你好。\n")

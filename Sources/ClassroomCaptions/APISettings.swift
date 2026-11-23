@@ -155,13 +155,24 @@ enum TranslationProtocol: String, CaseIterable, Identifiable {
         """
 }
 
-struct TranslationService {
-    let connection: APIConnection
+struct TranslationTuning {
+    let endpoint: APIEndpoint
     let format: TranslationProtocol
     let model: TranslationConfiguration
 }
 
+struct TranslationService {
+    let connection: APIConnection
+    let format: TranslationProtocol
+    let model: TranslationConfiguration
+
+    func applying(_ tuning: TranslationTuning?) -> Self {
+        guard let tuning, tuning.endpoint == connection.endpoint, tuning.format == format else { return self }
+        return Self(connection: connection, format: format, model: tuning.model)
+    }
+}
+
 struct SessionAPIs {
     let transcription: TranscriptionService
-    let translation: TranslationService
+    var translation: TranslationService
 }

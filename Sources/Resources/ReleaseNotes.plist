@@ -3,11 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.0.2</string>
+    <string>1.1.0</string>
     <key>highlights</key>
     <array>
-        <string>防止把密钥、录音和字幕写入 Git 仓库。若旧设置指向 Git 仓库，改用本机默认保存目录。</string>
-        <string>使用指南列出密钥、偏好设置、课堂记录和诊断日志的本机路径。</string>
+        <string>字幕窗底部实时生成的段落只显示原文，下一段开始后才为上一段生成译文草稿。</string>
     </array>
 </dict>
 </plist>

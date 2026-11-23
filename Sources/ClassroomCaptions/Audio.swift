@@ -35,22 +35,22 @@ struct SoundActivity {
 struct QueuedAudioEvent {
     let event: AudioEvent
     let queuedAt: ContinuousClock.Instant
-    var recordingStartSeconds: Int64? = nil
+    var recordingSeconds: Int64? = nil
 }
 
 struct AudioPacketBatcher {
-    static let packetBytes = 4 * SpeechSegmenter.bytesPerFrame
+    static let packetBytes = 2 * SpeechSegmenter.bytesPerFrame
     private var isFirstPacket = true
     private var buffered = Data()
     private var bufferedAt: ContinuousClock.Instant?
 
     mutating func append(_ event: AudioEvent, now: ContinuousClock.Instant,
-                         recordingStartSeconds: Int64? = nil) -> [QueuedAudioEvent] {
+                         recordingSeconds: Int64? = nil) -> [QueuedAudioEvent] {
         switch event {
         case .audio(let data):
             if isFirstPacket {
                 isFirstPacket = false
-                return [QueuedAudioEvent(event: .audio(data), queuedAt: now, recordingStartSeconds: recordingStartSeconds)]
+                return [QueuedAudioEvent(event: .audio(data), queuedAt: now, recordingSeconds: recordingSeconds)]
             }
             if buffered.isEmpty { bufferedAt = now }
             buffered.append(data)
@@ -358,7 +358,8 @@ final class AudioProcessor: @unchecked Sendable {
     let queue = DispatchQueue(label: "classroom-captions.audio", qos: .userInitiated)
     private let slots = DispatchSemaphore(value: 24)
     // Keep roughly the former queue duration with 80 ms packets.
-    private let stream = AudioEvents.makeStream(bufferingPolicy: .bufferingOldest(210))
+    // Keep about the same audio duration queued with 40 ms packets.
+    private let stream = AudioEvents.makeStream(bufferingPolicy: .bufferingOldest(420))
     private let output = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(SpeechSegmenter.sampleRate),
                                        channels: 1, interleaved: true)!
     private let recording: SessionRecording?
@@ -484,7 +485,7 @@ final class AudioProcessor: @unchecked Sendable {
         let now = ContinuousClock.now
         let startSeconds = recordingStartSample.map { ($0 + segmenter.speechStartSample) / Int64(SpeechSegmenter.sampleRate) }
         for event in events {
-            for packet in packetBatcher.append(event, now: now, recordingStartSeconds: startSeconds) {
+            for packet in packetBatcher.append(event, now: now, recordingSeconds: startSeconds) {
                 if case .dropped = stream.continuation.yield(packet) {
                     AppLog.event("audio.upload.overload")
                     stream.continuation.finish(throwing: AppFailure.audioOverload)

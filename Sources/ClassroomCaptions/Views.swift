@@ -1,19 +1,102 @@
 import AppKit
 import SwiftUI
 
+struct TranscriptHistoryView: View {
+    @ObservedObject var session: ClassroomSession
+    @StateObject private var page = HistoryPage()
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            HStack {
+                Button("较新") { page.cursors.removeLast() }.disabled(page.cursors.count < 2 || page.loading)
+                Button("较早") {
+                    if let last = page.entries.last { page.cursors.append(last.id) }
+                }
+                .disabled(!page.canLoadOlder || page.loading)
+                Spacer()
+                Button("刷新") {
+                    page.cursors = [.max]
+                    page.refresh += 1
+                }
+            }
+            if let error = page.error { Text(error).foregroundStyle(.red) }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 12) {
+                    ForEach(page.entries) { entry in
+                        Text(entry.text)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+            }
+        }
+        .padding()
+        .task(id: PageID(session: session.historyID, before: page.cursors.last ?? .max, refresh: page.refresh)) {
+            await load(before: page.cursors.last ?? .max)
+        }
+        .onChange(of: session.historyID) { _, _ in
+            page.entries = []
+            page.canLoadOlder = false
+            page.cursors = [.max]
+        }
+    }
+
+    private func load(before: Int) async {
+        let sessionID = session.historyID
+        let refresh = page.refresh
+        page.loading = true
+        defer { if !Task.isCancelled { page.loading = false } }
+        do {
+            let entries = try await session.historyPage(before: before)
+            guard !Task.isCancelled, session.historyID == sessionID, page.cursors.last == before, page.refresh == refresh else { return }
+            page.entries = Array(entries.prefix(TranscriptArchive.pageSize))
+            page.canLoadOlder = entries.count > TranscriptArchive.pageSize
+            page.error = nil
+        } catch {
+            guard !Task.isCancelled, session.historyID == sessionID, page.cursors.last == before, page.refresh == refresh else { return }
+            page.error = "未能读取本节课历史。请刷新后重试。"
+        }
+    }
+
+    private struct PageID: Equatable {
+        let session: UUID
+        let before: Int
+        let refresh: Int
+    }
+
+    private final class HistoryPage: ObservableObject {
+        @Published var entries: [TranscriptArchive.Entry] = []
+        @Published var canLoadOlder = false
+        @Published var error: String?
+        @Published var cursors: [Int] = [.max]
+        @Published var loading = false
+        @Published var refresh = 0
+    }
+}
+
 struct CaptionView: View {
     @ObservedObject var session: ClassroomSession
     @ObservedObject var preferences: Preferences
     @ObservedObject var titlebar: CaptionTitlebarLayout
     @StateObject private var scrollState = CaptionScrollState()
+    @StateObject private var markerFeedback = MarkerFeedback()
     let begin: () -> Void
     let togglePause: () -> Void
     let stop: () -> Void
     let stopAndSaveAs: () -> Void
 
     private var foreground: Color { preferences.panelForeground }
-    private var originalColor: Color { preferences.originalTypography.color?.swiftUIColor ?? foreground.opacity(0.80) }
-    private var translationColor: Color { preferences.translationTypography.color?.swiftUIColor ?? foreground }
+    private var languageShadow: Color { foreground == .black ? .black.opacity(0.65) : .clear }
+    private var automaticOriginalColor: Color { foreground.opacity(0.80) }
+    private var originalColor: Color {
+        preferences.captionColors.original.resolved(automatic: automaticOriginalColor, original: automaticOriginalColor)
+    }
+    private var translationColor: Color {
+        preferences.captionColors.final.resolved(automatic: foreground, original: originalColor)
+    }
+    private var draftColor: Color {
+        preferences.captionColors.draft.resolved(automatic: automaticOriginalColor, original: originalColor)
+    }
 
     private var stateColor: Color {
         switch session.phase {
@@ -42,7 +125,7 @@ struct CaptionView: View {
                     .padding(.horizontal, 18)
                     .padding(.top, 7)
             }
-            if session.captions.isEmpty && session.liveDrafts.unbound.isEmpty {
+            if session.captions.isEmpty && session.liveParagraphs.isEmpty {
                 Spacer(minLength: 0)
             } else {
                 transcript
@@ -54,10 +137,14 @@ struct CaptionView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: preferences.background).opacity(preferences.opacity))
         .ignoresSafeArea(.container, edges: .top)
+        .onChange(of: session.markers.last) { _, marker in
+            markerFeedback.update(confirmed: marker != nil)
+        }
     }
 
     private func toolbar(compact: Bool) -> some View {
-        let paused = session.phase == .paused
+        let listening = session.phase == .listening
+        let canToggle = listening || session.phase == .paused || session.phase == .idle
         let buttonWidth: CGFloat = compact ? 22 : 26
         return HStack(spacing: compact ? 3 : 6) {
             Circle()
@@ -70,6 +157,8 @@ struct CaptionView: View {
             languageMenu("源语言", values: Language.sources, selection: $preferences.sourceID, compact: compact)
             Image(systemName: "arrow.right")
                 .font(.system(size: 9))
+                .foregroundStyle(.white)
+                .shadow(color: languageShadow, radius: 1.6, y: 1)
                 .accessibilityHidden(true)
             languageMenu("目标语言", values: Language.targets, selection: $preferences.targetID, compact: compact)
             Spacer(minLength: compact ? 2 : 6)
@@ -82,9 +171,17 @@ struct CaptionView: View {
                     .accessibilityValue(elapsed)
             }
             HStack(spacing: compact ? 2 : 4) {
-                control("开始", "play.fill", width: buttonWidth, enabled: session.phase == .idle, action: begin)
-                control(paused ? "继续" : "暂停", paused ? "play.fill" : "pause.fill",
-                        width: buttonWidth, enabled: paused || session.phase == .listening, action: togglePause)
+                control(listening ? "暂停" : session.phase == .paused ? "继续" : "开始",
+                        listening ? "pause.fill" : "play.fill", width: buttonWidth, enabled: canToggle) {
+                    if session.phase == .idle { begin() } else { togglePause() }
+                }
+                let markerHelp = session.markers.last.map { "添加回听标记 · 上次 \($0.line)" } ?? "添加回听标记"
+                toolbarButton(markerHelp, width: buttonWidth, enabled: listening, action: session.addMarker) {
+                    Image(systemName: "flag")
+                        .foregroundStyle(listening && markerFeedback.isHighlighted ? Color.yellow : foreground)
+                }
+                .accessibilityLabel("添加回听标记")
+                .accessibilityValue(session.markers.last?.line ?? "暂无标记")
                 control("停止", "stop.fill", width: buttonWidth,
                         enabled: session.phase != .idle && session.phase != .stopping, action: stop)
                 toolbarButton("停止并另存为", width: buttonWidth, enabled: session.canStopAndSaveAs, action: stopAndSaveAs) {
@@ -140,19 +237,32 @@ struct CaptionView: View {
         case .traditional: compact ? "繁中" : "繁体中文"
         default: language.label
         }
-        return Menu {
-            Picker(title, selection: selection) {
-                ForEach(values) { Text($0.label).tag($0.id) }
-            }
-        } label: {
+        return HStack(spacing: 4) {
             Text(shortLabel).lineLimit(1)
+            if !compact {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+            }
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(compact ? .hidden : .visible)
+        .foregroundStyle(.white)
+        .shadow(color: languageShadow, radius: 1.6, y: 1)
         .fixedSize()
-        .accessibilityLabel(title)
-        .accessibilityValue(language.label)
-        .help(title)
+        .accessibilityHidden(true)
+        // AppKit applies the system text color to borderless menu labels.
+        .overlay {
+            Menu {
+                Picker(title, selection: selection) {
+                    ForEach(values) { Text($0.label).tag($0.id) }
+                }
+            } label: {
+                Color.clear.contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .accessibilityLabel(title)
+            .accessibilityValue(language.label)
+            .help(title)
+        }
     }
 
     private var originalFont: Font { preferences.originalTypography.font(defaultWeight: .regular) }
@@ -164,14 +274,19 @@ struct CaptionView: View {
         return ceil(font.ascender - font.descender + font.leading)
     }
 
-    private func liveOriginal(_ text: String) -> some View {
-        Text(text)
-            .font(originalFont)
-            .foregroundStyle(originalColor)
-            .fixedSize(horizontal: false, vertical: true)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityIdentifier("liveOriginal")
+    private func liveCaptionRow(_ caption: LiveCaption) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(caption.original)
+                .font(originalFont)
+                .foregroundStyle(originalColor)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .accessibilityIdentifier("liveOriginal")
+            if !caption.translation.isEmpty {
+                translationLine(caption.translation, draft: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var transcript: some View {
@@ -180,11 +295,11 @@ struct CaptionView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         LazyVStack(alignment: .leading, spacing: 13) {
-                            ForEach(Caption.visibleRows(session.captions, drafts: session.liveDrafts.bound)) { caption in
+                            ForEach(Caption.visibleRows(session.visibleCaptions)) { caption in
                                 captionRow(caption)
                             }
-                            ForEach(session.liveDrafts.unbound) { draft in
-                                liveOriginal(draft.text)
+                            ForEach(session.liveParagraphs) { caption in
+                                liveCaptionRow(caption)
                             }
                         }
                         .padding(.horizontal, 18)
@@ -230,16 +345,13 @@ struct CaptionView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             if !caption.translation.isEmpty {
-                Text(caption.translation)
-                    .font(translationFont)
-                    .foregroundStyle(translationColor)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            } else if caption.translationFailed {
+                translationLine(caption.translation, draft: caption.translationIsDraft)
+            }
+            if caption.translationFailed {
                 Button("翻译未完成 · 重试") { session.retryTranslation(caption.id) }
                     .font(.system(size: 12, weight: .medium))
                     .overlay(alignment: .bottom) { Rectangle().frame(height: 1).opacity(0.45) }
-            } else if caption.originalFinal && !caption.original.isEmpty {
+            } else if caption.translation.isEmpty && caption.originalFinal && !caption.original.isEmpty {
                 Text("正在翻译…")
                     .font(.system(size: 12))
                     .foregroundStyle(foreground.opacity(0.65))
@@ -248,11 +360,41 @@ struct CaptionView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
     }
+
+    private func translationLine(_ text: String, draft: Bool) -> some View {
+        Text(text)
+            .font(translationFont)
+            .foregroundStyle(draft ? draftColor : translationColor)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+            .accessibilityLabel(draft ? "译文草稿。\(text)" : text)
+    }
 }
 
 private final class CaptionScrollState: ObservableObject {
     var follow = CaptionScrollFollow()
     var scheduled = false
+}
+
+@MainActor
+private final class MarkerFeedback: ObservableObject {
+    @Published private(set) var isHighlighted = false
+    private var resetTask: Task<Void, Never>?
+
+    func update(confirmed: Bool) {
+        resetTask?.cancel()
+        isHighlighted = confirmed
+        guard confirmed else {
+            resetTask = nil
+            return
+        }
+        resetTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(350)) }
+            catch { return }
+            self?.isHighlighted = false
+            self?.resetTask = nil
+        }
+    }
 }
 
 private struct CaptionScrollGeometry: PreferenceKey {
@@ -278,6 +420,107 @@ private extension CaptionTypography {
 
 private extension CaptionRGB {
     var swiftUIColor: Color { Color(.sRGB, red: red, green: green, blue: blue) }
+
+    init?(color: Color) {
+        guard let rgb = NSColor(color).usingColorSpace(.sRGB) else { return nil }
+        self.init(red: rgb.redComponent, green: rgb.greenComponent, blue: rgb.blueComponent)
+    }
+}
+
+private extension CaptionColorSetting {
+    func resolved(automatic: Color, original: Color) -> Color {
+        switch choice {
+        case .automatic: automatic
+        case .originalGray: original
+        case .custom: customColor?.swiftUIColor ?? automatic
+        default: choice.rgb?.swiftUIColor ?? automatic
+        }
+    }
+}
+
+private struct CaptionColorControls: View {
+    private final class HexEditor: ObservableObject {
+        @Published var text: String?
+    }
+
+    @StateObject private var editor = HexEditor()
+    let title: String
+    @Binding var setting: CaptionColorSetting
+    let automaticColor: Color
+    let originalColor: Color
+
+    private var color: Color { setting.resolved(automatic: automaticColor, original: originalColor) }
+    private var parsedHex: CaptionRGB? { editor.text.flatMap(CaptionRGB.init(hex:)) }
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 7) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(color)
+                    .overlay { RoundedRectangle(cornerRadius: 3).strokeBorder(.secondary.opacity(0.45)) }
+                    .frame(width: 16, height: 12)
+                    .accessibilityHidden(true)
+                Picker(title, selection: Binding(get: { setting.choice }, set: selectColor)) {
+                    ForEach(CaptionColorChoice.allCases) { choice in
+                        Text(choice.label).tag(choice)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+            }
+        }
+        .settingsHelp("选择预设或「自定义颜色」。更改会立即显示在字幕窗。")
+        if setting.choice == .custom {
+            ColorPicker("调色盘", selection: Binding(get: { color }, set: applyPickerColor), supportsOpacity: false)
+                .accessibilityLabel("\(title)调色盘")
+                .settingsHelp("点击色块打开系统调色盘。")
+            LabeledContent("色值") {
+                HStack(spacing: 8) {
+                    TextField("色值", text: Binding(
+                        get: { editor.text ?? setting.customColor?.hex ?? "" },
+                        set: { editor.text = $0 }
+                    ), prompt: Text("#BBCFBE"))
+                    .textFieldStyle(.roundedBorder)
+                    .monospaced()
+                    .frame(width: 106)
+                    .accessibilityLabel("\(title)色值")
+                    .onSubmit(applyHex)
+                    Button("应用", action: applyHex)
+                        .disabled(parsedHex == nil)
+                        .accessibilityLabel("应用\(title)色值")
+                }
+            }
+            .settingsHelp("输入六位十六进制色值，例如 #BBCFBE，按回车或点击「应用」。")
+            if let text = editor.text, !text.isEmpty, parsedHex == nil {
+                Text("请输入六位十六进制色值，例如 #BBCFBE。")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func selectColor(_ choice: CaptionColorChoice) {
+        var updated = setting
+        if choice == .custom, updated.customColor == nil {
+            updated.customColor = CaptionRGB(color: color)
+        }
+        updated.choice = choice
+        setting = updated
+        editor.text = nil
+    }
+
+    private func applyPickerColor(_ color: Color) {
+        guard let rgb = CaptionRGB(color: color) else { return }
+        setting.customColor = rgb
+        editor.text = nil
+    }
+
+    private func applyHex() {
+        guard let parsedHex else { return }
+        setting.customColor = parsedHex
+        editor.text = nil
+    }
 }
 
 @MainActor
@@ -361,9 +604,9 @@ final class APIKeySettings: ObservableObject {
             testStatus = "正在请求 \(connection.endpoint.base.host ?? "API")…"
             testTask = Task {
                 do {
-                    let result = try await operation()
+                    _ = try await operation()
                     guard !Task.isCancelled else { return }
-                    testStatus = "测试通过 · \(APIResponseError.clean(result, key: connection.key))"
+                    testStatus = "测试通过"
                 } catch {
                     guard !Task.isCancelled else { return }
                     testStatus = "测试失败 · \(APIResponseError.clean(error.localizedDescription, key: connection.key))"
@@ -379,6 +622,11 @@ final class APIKeySettings: ObservableObject {
 
 struct SettingsView: View {
     @StateObject private var help = SettingsHelp()
+    private final class TranslationModelDraft: ObservableObject {
+        @Published var text: String?
+    }
+
+    @StateObject private var translationDraft = TranslationModelDraft()
     @ObservedObject var preferences: Preferences
     @ObservedObject var transcriptionKey: APIKeySettings
     @ObservedObject var translationKey: APIKeySettings
@@ -387,6 +635,22 @@ struct SettingsView: View {
     let revealDiagnostics: () -> Void
     let openGuide: () -> Void
     let openAbout: () -> Void
+
+    private var pendingCustomTranslationModel: Bool {
+        preferences.translationModel == .custom &&
+            (translationDraft.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? preferences.customTranslationModelID) != preferences.customTranslationModelID
+    }
+
+    private var canApplyCustomTranslationModel: Bool {
+        pendingCustomTranslationModel &&
+            (try? TranslationModel.custom.configuration(customID: translationDraft.text ?? "")) != nil
+    }
+
+    private func applyCustomTranslationModel() {
+        guard canApplyCustomTranslationModel, let draft = translationDraft.text else { return }
+        preferences.customTranslationModelID = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        translationDraft.text = nil
+    }
 
     var body: some View {
         Form {
@@ -408,21 +672,20 @@ struct SettingsView: View {
             }
             Section("分句") {
                 Slider(value: Binding(
-                    get: { Double(preferences.segmentationLength.rawValue) },
-                    set: { value in
-                        if let length = SegmentationLength(rawValue: Int(value.rounded())) {
-                            preferences.segmentationLength = length
-                        }
-                    }
-                ), in: Double(SegmentationLength.short.rawValue)...Double(SegmentationLength.extended.rawValue), step: 1) {
-                    Text("分句长短")
+                    get: { Double(preferences.sentencesPerTranslation) },
+                    set: { preferences.sentencesPerTranslation = Int($0.rounded()) }
+                ), in: Double(SentenceBatcher.counts.lowerBound)...Double(SentenceBatcher.counts.upperBound), step: 1) {
+                    Text("每批翻译句数")
                 } minimumValueLabel: {
-                    Text("短")
+                    Text("1 句")
                 } maximumValueLabel: {
-                    Text("长")
+                    Text("5 句")
                 }
-                .accessibilityValue(preferences.segmentationLength.title)
-                .settingsHelp("\(preferences.segmentationLength.detail)。下次开始转写时生效。")
+                .accessibilityValue("\(preferences.sentencesPerTranslation) 句")
+                .settingsHelp("录制中调整立即生效。已凑齐的完整句子可立即提交，原文继续显示。")
+                Text("当前 \(preferences.sentencesPerTranslation) 句 · 默认 1 句")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
             }
             Section("自动暂停") {
                 Toggle("无声时自动暂停", isOn: $preferences.silencePauseEnabled)
@@ -480,10 +743,20 @@ struct SettingsView: View {
                 .settingsHelp("向左调低可让字幕窗背景更透明。")
             }
             Section("原文字幕字体") {
-                fontControls($preferences.originalTypography, colorLabel: "原文字体颜色")
+                fontControls($preferences.originalTypography)
             }
             Section("译文字幕字体") {
-                fontControls($preferences.translationTypography, colorLabel: "译文字体颜色")
+                fontControls($preferences.translationTypography)
+            }
+            Section("字幕颜色") {
+                let automaticOriginal = preferences.panelForeground.opacity(0.80)
+                let original = preferences.captionColors.original.resolved(automatic: automaticOriginal, original: automaticOriginal)
+                CaptionColorControls(title: "原文颜色", setting: $preferences.captionColors.original,
+                                     automaticColor: automaticOriginal, originalColor: automaticOriginal)
+                CaptionColorControls(title: "译文草稿颜色", setting: $preferences.captionColors.draft,
+                                     automaticColor: automaticOriginal, originalColor: original)
+                CaptionColorControls(title: "正式译文颜色", setting: $preferences.captionColors.final,
+                                     automaticColor: preferences.panelForeground, originalColor: original)
             }
             Section("转写") {
                 TextField("转写 API 地址", text: $preferences.transcriptionAddress, prompt: Text(APIEndpoint.openAI.absoluteString))
@@ -522,18 +795,30 @@ struct SettingsView: View {
                                         label: \.label)
                         .fixedSize()
                 }
-                .onChange(of: preferences.translationModel) { _, _ in translationKey.clearTest() }
-                .settingsHelp("选择生成译文的模型。服务商提供其他模型时，可选「自定义」。")
+                .onChange(of: preferences.translationModel) { _, _ in
+                    translationDraft.text = nil
+                    translationKey.clearTest()
+                }
+                .settingsHelp("沿用本节课的翻译地址和接口时，新模型从下一批待提交字幕生效。")
                 if preferences.translationModel == .custom {
-                    TextField("翻译模型 ID", text: $preferences.customTranslationModelID, prompt: Text("例如 gpt-6-luna"))
-                        .onChange(of: preferences.customTranslationModelID) { _, _ in translationKey.clearTest() }
-                        .settingsHelp("输入服务商提供的文本模型 ID，再点「测试翻译」。")
+                    TextField("翻译模型 ID", text: Binding(
+                        get: { translationDraft.text ?? preferences.customTranslationModelID },
+                        set: { draft in
+                            translationDraft.text = draft
+                            translationKey.clearTest()
+                        }
+                    ), prompt: Text("例如 gpt-6-luna"))
+                    .onSubmit(applyCustomTranslationModel)
+                    .settingsHelp("输入服务商提供的模型 ID，再点「应用模型」或按回车。")
+                    Button("应用模型", action: applyCustomTranslationModel)
+                        .disabled(!canApplyCustomTranslationModel)
+                        .settingsHelp("使用填好的模型 ID 提交之后的译文，并可测试新模型。")
                 }
                 Toggle("翻译 Fast 模式", isOn: preferences.translationModel.allowsFast ? $preferences.fastTranslation : .constant(false))
                     .disabled(!preferences.translationModel.allowsFast)
                     .onChange(of: preferences.fastTranslation) { _, _ in translationKey.clearTest() }
-                    .settingsHelp("开启时会请求 Fast。支持情况与费用取决于所选模型和服务商。")
-                apiControls(translationKey)
+                    .settingsHelp("默认关闭。打开时从下一批待提交字幕开始请求 Fast，支持情况和费用取决于所选模型和服务商。")
+                apiControls(translationKey, canTest: !pendingCustomTranslationModel)
             }
             Section("快捷键") {
                 ForEach(CaptionShortcutAction.allCases) { action in
@@ -586,7 +871,7 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private func apiControls(_ key: APIKeySettings) -> some View {
+    private func apiControls(_ key: APIKeySettings, canTest: Bool = true) -> some View {
         SecureField("\(key.role.title) API Key", text: Binding(get: { key.entry }, set: { key.entry = $0 }),
                     prompt: Text(key.hasSavedKey ? "输入新 Key 以替换" : "粘贴 API Key"))
             .onSubmit { if key.hasEntry { key.save(preferences) } }
@@ -606,7 +891,8 @@ struct SettingsView: View {
             Button(key.isTesting ? "取消测试" : "测试\(key.role.title)") {
                 if key.isTesting { key.clearTest() } else { key.test(preferences) }
             }
-            .settingsHelp(key.isTesting ? "取消本次测试请求。" : key.role == .transcription
+            .disabled(!canTest && !key.isTesting)
+            .settingsHelp(!canTest ? "先应用自定义模型，再测试翻译。" : key.isTesting ? "取消本次测试请求。" : key.role == .transcription
                   ? "发送内置音频样例，测试可能计费。"
                   : "发送一句固定文本测试翻译，测试可能计费。")
         }
@@ -619,7 +905,7 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private func fontControls(_ style: Binding<CaptionTypography>, colorLabel: String) -> some View {
+    private func fontControls(_ style: Binding<CaptionTypography>) -> some View {
         Picker("字体样式", selection: style.design) {
             ForEach(CaptionFontDesign.allCases) { Text($0.label).tag($0) }
         }
@@ -632,19 +918,6 @@ struct SettingsView: View {
             .settingsHelp("用粗体显示字幕。")
         Toggle("斜体", isOn: style.italic)
             .settingsHelp("用斜体显示字幕。")
-        ColorPicker(colorLabel, selection: Binding(
-            get: { style.wrappedValue.color?.swiftUIColor ?? preferences.panelForeground },
-            set: { input in
-                if let rgb = NSColor(input).usingColorSpace(.sRGB) {
-                    style.wrappedValue.color = CaptionRGB(red: rgb.redComponent, green: rgb.greenComponent, blue: rgb.blueComponent)
-                }
-            }
-        ), supportsOpacity: false)
-        .settingsHelp("为这组字幕指定文字颜色。")
-        if style.wrappedValue.color != nil {
-            Button("恢复自动颜色") { style.wrappedValue.color = nil }
-                .settingsHelp("根据字幕窗背景自动选择易读的文字颜色。")
-        }
     }
 
 }
