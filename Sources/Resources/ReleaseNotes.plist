@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.0.9</string>
+    <string>1.0.11</string>
     <key>highlights</key>
     <array>
-        <string>字幕窗顶部的源语言、目标语言和下拉箭头统一为白色。</string>
+        <string>实时原文识别到可信句末后就按设定句数换段，定稿后校正原文并回填译文。</string>
     </array>
 </dict>
 </plist>

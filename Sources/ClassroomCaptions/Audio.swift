@@ -57,7 +57,7 @@ struct AudioPacketBatcher {
             return buffered.count >= Self.packetBytes ? flush() : []
         case .commit:
             isFirstPacket = true
-            return flush() + [QueuedAudioEvent(event: event, queuedAt: now, recordingSeconds: recordingSeconds)]
+            return flush() + [QueuedAudioEvent(event: event, queuedAt: now)]
         }
     }
 
@@ -97,7 +97,7 @@ struct SpeechSegmenter {
     private var activeFrames = 0
     private var silentFrames = 0
     private var continuing = false
-    private(set) var processedFrames: Int64 = 0
+    private var processedFrames: Int64 = 0
     private(set) var speechStartSample: Int64 = 0
     private(set) var lastRMS = 0.0
     private(set) var lastThreshold = 0.0
@@ -483,16 +483,8 @@ final class AudioProcessor: @unchecked Sendable {
         guard !events.isEmpty else { return }
         let now = ContinuousClock.now
         let startSeconds = recordingStartSample.map { ($0 + segmenter.speechStartSample) / Int64(SpeechSegmenter.sampleRate) }
-        let endSeconds = recordingStartSample.map {
-            ($0 + segmenter.processedFrames * Int64(SpeechSegmenter.samplesPerFrame)) / Int64(SpeechSegmenter.sampleRate)
-        }
         for event in events {
-            let timestamp: Int64?
-            switch event {
-            case .audio: timestamp = startSeconds
-            case .commit: timestamp = endSeconds
-            }
-            for packet in packetBatcher.append(event, now: now, recordingSeconds: timestamp) {
+            for packet in packetBatcher.append(event, now: now, recordingSeconds: startSeconds) {
                 if case .dropped = stream.continuation.yield(packet) {
                     AppLog.event("audio.upload.overload")
                     stream.continuation.finish(throwing: AppFailure.audioOverload)

@@ -42,10 +42,8 @@ final class ClassroomSession: ObservableObject {
     @Published private(set) var phase = Phase.idle
     @Published private(set) var status = "准备就绪"
     @Published private(set) var captions: [Caption] = []
-    @Published private(set) var pendingOriginals: [Caption] = []
-    @Published private(set) var waitingText = ""
+    @Published private(set) var liveParagraphs: [String] = []
     @Published private(set) var markers: [RecordingMarker] = []
-    @Published private(set) var liveDrafts = TranscriptDrafts.Snapshot()
     @Published private(set) var notice: String?
     @Published private(set) var recordingClock = RecordingClock()
     @Published private(set) var automaticExportURL: URL?
@@ -59,6 +57,7 @@ final class ClassroomSession: ObservableObject {
     private var chooseSaveCopy: ((String, String?) async -> SessionExport?)?
 
     private var drafts = TranscriptDrafts()
+    private var pendingOriginals: [Caption] = []
     private var indices: [UUID: Int] = [:]
     private var nextCaptionPosition = 0
     private var transcriptArchive: TranscriptArchive?
@@ -135,8 +134,8 @@ final class ClassroomSession: ObservableObject {
         AppLog.event("session.translation_sentence_count", number: count)
         if let context = batchContext {
             submitCompleteBatches(context: context)
-            waitingText = sentenceBatch.text
         }
+        publishOriginal()
     }
 
     func start(
@@ -195,7 +194,7 @@ final class ClassroomSession: ObservableObject {
         captions.removeAll()
         pendingOriginals.removeAll()
         markers.removeAll()
-        waitingText = ""
+        liveParagraphs = []
         sentenceBatch = .init()
         batchContext = nil
         indices.removeAll()
@@ -203,7 +202,6 @@ final class ClassroomSession: ObservableObject {
         submitted.removeAll()
         originalRefresh?.cancel()
         originalRefresh = nil
-        liveDrafts = TranscriptDrafts.Snapshot()
         notice = nil
         recordingClock = RecordingClock()
         automaticExportURL = nil
@@ -517,7 +515,9 @@ final class ClassroomSession: ObservableObject {
         while !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty || !workers.isEmpty ||
                 !translationQueue.isEmpty || !sentenceBatch.text.isEmpty {
             if Task.isCancelled { break }
-            if recoveryWorkers.isEmpty && recoveryQueue.isEmpty { flushSentenceBatch() }
+            if recoveryWorkers.isEmpty && recoveryQueue.isEmpty && !sentenceBatch.text.isEmpty {
+                flushSentenceBatch()
+            }
             if phase == .stopping {
                 let pendingRecovery = !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty
                 let message = pendingRecovery ? "正在处理剩余音频…" : "正在补齐译文…"
@@ -530,7 +530,6 @@ final class ClassroomSession: ObservableObject {
     private func finishPause() {
         if let active { retire(active) }
         active = nil
-        publishOriginal()
         if pendingOriginals.isEmpty { flushSentenceBatch() }
         phase = .paused
         status = pausedForSilence ? "无声超时，已自动暂停" : "已暂停"
@@ -577,10 +576,7 @@ final class ClassroomSession: ObservableObject {
                     if let active { try await active.append(data) }
                 case .commit(let boundary):
                     if let id = segment {
-                        if let index = pendingIndex(id) {
-                            pendingOriginals[index].translationLanguage = target
-                            pendingOriginals[index].recordingEndSeconds = packet.recordingSeconds
-                        }
+                        if let index = pendingIndex(id) { pendingOriginals[index].translationLanguage = target }
                         let audio = pcm.isEmpty ? nil : SegmentAudio(pcm: pcm, source: segmentSource)
                         rememberSubmission(id, boundary: boundary, audio: audio)
                         pcm = Data()
@@ -760,7 +756,6 @@ final class ClassroomSession: ObservableObject {
     private func resolveRealtime(_ id: UUID, text: String?) {
         guard let index = pendingIndex(id), !pendingOriginals[index].originalFinal, recoveryWorkers[id] == nil,
               !recoveryQueue.contains(where: { $0.id == id }) else { return }
-        defer { publishOriginal() }
         let partial = drafts.remove(id)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let segment = submitted.removeValue(forKey: id)
         if let segment, text != nil {
@@ -786,6 +781,7 @@ final class ClassroomSession: ObservableObject {
             if !partial.isEmpty { pendingOriginals[index].original = partial }
             recoveryQueue.append(Recovery(id: id, audio: audio, partial: partial, omitIfEmpty: omitIfEmpty))
             startQueuedRecovery(using: service)
+            publishOriginal()
         } else {
             if segment?.audio != nil {
                 AppLog.event("transcription.recovery.skipped")
@@ -853,6 +849,7 @@ final class ClassroomSession: ObservableObject {
             collectSentences(from: next)
         }
         if pendingOriginals.isEmpty, phase == .paused { flushSentenceBatch() }
+        publishOriginal()
     }
 
     private func collectSentences(from original: Caption) {
@@ -868,13 +865,7 @@ final class ClassroomSession: ObservableObject {
         batchContext = context
         sentenceBatch.append(original.original, at: original.recordingStartSeconds, language: context.source)
         submitCompleteBatches(context: context)
-        if let start = sentenceBatch.startSeconds, let current = original.recordingEndSeconds ?? original.recordingStartSeconds,
-           current - start >= SentenceBatcher.maximumSeconds,
-           let batch = sentenceBatch.takeAtLimit(language: context.source) {
-            submitBatch(batch, context: context)
-        }
-        waitingText = sentenceBatch.text
-        if !waitingText.isEmpty {
+        if !sentenceBatch.text.isEmpty {
             batchUpdatedAt = SuspendingClock().now
             armBatchTimer()
         }
@@ -898,16 +889,12 @@ final class ClassroomSession: ObservableObject {
     }
 
     private func finishIdleBatch() -> Bool {
-        guard !sentenceBatch.text.isEmpty, let context = batchContext else { return true }
+        guard !sentenceBatch.text.isEmpty else { return true }
         guard pendingOriginals.isEmpty, phase != .stopping else { return false }
         let idle = (capture?.lastHeardAt ?? batchUpdatedAt).duration(to: SuspendingClock().now)
-        if phase == .paused || idle >= .seconds(5) {
-            if let batch = sentenceBatch.flush() { submitBatch(batch, context: context) }
-        } else if idle >= .seconds(3), let batch = sentenceBatch.takeCompleted(language: context.source) {
-            submitBatch(batch, context: context)
-        }
-        waitingText = sentenceBatch.text
-        return waitingText.isEmpty
+        guard phase == .paused || idle >= .seconds(5) else { return false }
+        flushSentenceBatch()
+        return true
     }
 
     private func flushSentenceBatch() {
@@ -915,7 +902,7 @@ final class ClassroomSession: ObservableObject {
         batchTimer = nil
         if let context = batchContext, let batch = sentenceBatch.flush() { submitBatch(batch, context: context) }
         batchContext = nil
-        waitingText = ""
+        publishOriginal()
     }
 
     private func submitBatch(_ batch: SentenceBatcher.Batch, context: TranslationContext) {
@@ -940,8 +927,10 @@ final class ClassroomSession: ObservableObject {
     }
 
     private func publishOriginal() {
-        let snapshot = drafts.snapshot()
-        if snapshot != liveDrafts { liveDrafts = snapshot }
+        let text = drafts.snapshot().paragraph(after: sentenceBatch.text, pending: pendingOriginals)
+        let language = batchContext?.source ?? pendingOriginals.first?.originalLanguage ?? active?.configuredSource ?? source
+        let paragraphs = SentenceBatcher.previewParagraphs(text, count: sentenceCount, language: language)
+        if paragraphs != liveParagraphs { liveParagraphs = paragraphs }
     }
 
     private func scheduleOriginalRefresh() {

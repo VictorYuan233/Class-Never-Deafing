@@ -19,6 +19,8 @@ struct CoreChecks {
         checkTranscriptionRecoveryRequest()
         checkRecoveryAmplification()
         checkTranscriptDrafts()
+        checkLiveParagraph()
+        checkLiveParagraphBoundaries()
         checkFailureRows()
         checkSoundActivity()
         try await checkSystemAudioConversion()
@@ -60,16 +62,60 @@ struct CoreChecks {
         precondition(drafts.snapshot() == TranscriptDrafts.Snapshot())
     }
 
+    private static func checkLiveParagraph() {
+        let connection = UUID()
+        var pending = Caption()
+        var drafts = TranscriptDrafts()
+        let waiting = "The first sentence is ready."
+        drafts.append("The second\nsentence is", connection: connection, item: "next")
+        let expected = "\(waiting) The second sentence is"
+        precondition(drafts.snapshot().paragraph(after: waiting, pending: [pending]) == expected)
+
+        drafts.bind(connection: connection, item: "next", to: pending.id)
+        precondition(drafts.snapshot().paragraph(after: waiting, pending: [pending]) == expected)
+        pending.original = "The second sentence is ready."
+        pending.originalFinal = true
+        drafts.append("The third", connection: connection, item: "tail")
+        precondition(drafts.snapshot().paragraph(after: waiting, pending: [pending]) ==
+            "\(waiting) The second sentence is ready. The third")
+        precondition(drafts.snapshot().paragraph(after: "", pending: []) == "The third")
+
+        pending.original = "还在听"
+        let chinese = TranscriptDrafts.Snapshot()
+        precondition(chinese.paragraph(after: "第一句。", pending: [pending]) == "第一句。还在听")
+    }
+
+    private static func checkLiveParagraphBoundaries() {
+        let spoken = "The first sentence is ready. The second sentence has begun"
+        precondition(SentenceBatcher.previewParagraphs(spoken, count: 1, language: .english) ==
+            ["The first sentence is ready.", "The second sentence has begun"])
+        precondition(SentenceBatcher.previewParagraphs(spoken, count: 2, language: .english) == [spoken])
+        let continued = spoken + ". The third sentence is"
+        precondition(SentenceBatcher.previewParagraphs(continued, count: 2, language: .english) ==
+            [spoken + ".", "The third sentence is"])
+
+        let sentence = "Dr. Tan measured 3.14 hertz."
+        precondition(SentenceBatcher.previewParagraphs(sentence, count: 1, language: .english) == [sentence])
+        precondition(SentenceBatcher.previewParagraphs(sentence + " The next reading", count: 1, language: .english) ==
+            [sentence, "The next reading"])
+        let incomplete = "If the reading rises. we will keep watching"
+        precondition(SentenceBatcher.previewParagraphs(incomplete, count: 1, language: .english) == [incomplete])
+        let revised = "The first sentence is ready, and the speaker continues"
+        precondition(SentenceBatcher.previewParagraphs(revised, count: 1, language: .english) == [revised])
+        precondition(SentenceBatcher.previewParagraphs("第一句好了。第二句正在说", count: 1, language: .simplified) ==
+            ["第一句好了。", "第二句正在说"])
+    }
+
     private static func checkFailureRows() {
         let firstFailure = Caption(originalFailed: true)
         let missedAgain = Caption(originalFailed: true)
-        let newSpeech = Caption()
+        var newSpeech = Caption(original: "Still speaking.")
         let nextFailure = Caption(originalFailed: true)
-        let captions = [firstFailure, Caption(), missedAgain, newSpeech, nextFailure, Caption(originalFailed: true)]
-        let rows = Caption.visibleRows(captions, drafts: [newSpeech.id: "Still speaking."])
+        let rows = Caption.visibleRows([firstFailure, Caption(), missedAgain, newSpeech, nextFailure, Caption(originalFailed: true)])
         precondition(rows.map(\.id) == [firstFailure.id, newSpeech.id, nextFailure.id])
         precondition(rows[1].original == "Still speaking." && !rows[1].originalFinal)
-        precondition(Caption.visibleRows(captions, drafts: [:]).map(\.id) == [firstFailure.id])
+        newSpeech.original = ""
+        precondition(Caption.visibleRows([firstFailure, missedAgain, newSpeech, nextFailure]).map(\.id) == [firstFailure.id])
     }
 
     private static func checkSoundActivity() {
@@ -529,7 +575,7 @@ struct CoreChecks {
         batcher.append("准备好了", at: 30, language: .simplified)
         batcher.append("吗？可以了。继续讲", at: 31, language: .simplified)
         precondition(batcher.take(count: 5, language: .simplified) == nil)
-        precondition(batcher.takeCompleted(language: .simplified)?.text == "准备好了吗？可以了。")
+        precondition(batcher.take(count: 2, language: .simplified)?.text == "准备好了吗？可以了。")
         precondition(batcher.flush()?.text == "继续讲" && batcher.flush() == nil)
 
         let french = Language.source("fr")
@@ -537,9 +583,10 @@ struct CoreChecks {
         batcher.append("était bon.", at: 41, language: french)
         precondition(batcher.take(count: 1, language: french)?.text == "Le café était bon.")
 
-        batcher.append("The instructor introduces a long example without a full stop, and continues explaining", at: 60, language: english)
-        precondition(batcher.takeAtLimit(language: english)?.text == "The instructor introduces a long example without a full stop,")
-        precondition(batcher.flush()?.text == "and continues explaining")
+        batcher.append("One sentence is ready.", at: 60, language: english)
+        batcher.append("The rest is still in progress", at: 93, language: english)
+        precondition(batcher.take(count: 2, language: english) == nil)
+        precondition(batcher.flush()?.text == "One sentence is ready. The rest is still in progress")
     }
 
     private static func checkLiveTranslationTuning() throws {
@@ -666,7 +713,7 @@ struct CoreChecks {
         precondition(recording.elapsedSeconds == 1)
         let speechPackets = try await capture(1200, using: recording)
         precondition(silentPackets.isEmpty)
-        precondition(speechPackets.compactMap(\.recordingSeconds) == [1, 1])
+        precondition(speechPackets.compactMap(\.recordingSeconds) == [1])
         precondition(recording.elapsedSeconds == 1)
         let outcome = await recording.finish(to: destination)
         guard let url = outcome.url, outcome.warning == nil else { preconditionFailure("Recording did not save") }

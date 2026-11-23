@@ -117,8 +117,7 @@ struct CaptionView: View {
                     .padding(.horizontal, 18)
                     .padding(.top, 7)
             }
-            if session.captions.isEmpty && session.pendingOriginals.isEmpty &&
-                session.waitingText.isEmpty && session.liveDrafts.unbound.isEmpty {
+            if session.captions.isEmpty && session.liveParagraphs.isEmpty {
                 Spacer(minLength: 0)
             } else {
                 transcript
@@ -283,26 +282,12 @@ struct CaptionView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         LazyVStack(alignment: .leading, spacing: 13) {
-                            ForEach(Caption.visibleRows(session.visibleCaptions, drafts: [:])) { caption in
+                            ForEach(Caption.visibleRows(session.visibleCaptions)) { caption in
                                 captionRow(caption)
                             }
-                            if !session.waitingText.isEmpty {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    liveOriginal(session.waitingText)
-                                    Text("等待完整句子…")
-                                        .font(.system(size: 12))
-                                        .foregroundStyle(foreground.opacity(0.65))
-                                }
-                            }
-                            ForEach(Caption.visibleRows(session.pendingOriginals, drafts: session.liveDrafts.bound)) { caption in
-                                if caption.original.isEmpty {
-                                    captionRow(caption)
-                                } else {
-                                    liveOriginal(caption.original)
-                                }
-                            }
-                            ForEach(session.liveDrafts.unbound) { draft in
-                                liveOriginal(draft.text)
+                            let liveParagraphs = session.liveParagraphs
+                            ForEach(liveParagraphs.indices, id: \.self) { index in
+                                liveOriginal(liveParagraphs[index])
                             }
                         }
                         .padding(.horizontal, 18)

@@ -33,7 +33,6 @@ struct Caption: Identifiable {
     let id = UUID()
     var position = 0
     var recordingStartSeconds: Int64?
-    var recordingEndSeconds: Int64?
     var original = ""
     var translation = ""
     var originalFinal = false
@@ -44,18 +43,16 @@ struct Caption: Identifiable {
     var originalLanguage = Language.automatic
     var captureID: UUID?
 
-    static func visibleRows(_ captions: [Caption], drafts: [UUID: String]) -> [Caption] {
+    static func visibleRows(_ captions: [Caption]) -> [Caption] {
         var lastRowWasFailure = false
-        return captions.compactMap { caption in
-            var row = caption
-            if row.original.isEmpty, let text = drafts[row.id] { row.original = text }
-            if !row.original.isEmpty {
+        return captions.filter { caption in
+            if !caption.original.isEmpty {
                 lastRowWasFailure = false
-                return row
+                return true
             }
-            guard row.originalFailed, !lastRowWasFailure else { return nil }
+            guard caption.originalFailed, !lastRowWasFailure else { return false }
             lastRowWasFailure = true
-            return row
+            return true
         }
     }
 }
@@ -63,7 +60,6 @@ struct Caption: Identifiable {
 struct SentenceBatcher {
     static let counts = 1...5
     static let defaultCount = 1
-    static let maximumSeconds: Int64 = 30
 
     struct Batch {
         let text: String
@@ -94,15 +90,13 @@ struct SentenceBatcher {
     mutating func append(_ original: String, at seconds: Int64?, language: Language) {
         let incoming = original.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let first = incoming.first else { return }
-        var separator = ""
+        var separator = Self.separator(after: text.last, before: first)
         if !text.isEmpty {
-            let lastComplete = sentenceEnds(language: language).last ?? text.startIndex
+            let lastComplete = Self.sentenceEnds(in: text, language: language).last ?? text.startIndex
             let tail = text[lastComplete...]
             if text.hasSuffix("."), Self.incomplete(tail.dropLast(), language: language), first.isASCII {
                 separator = Self.matches(Self.unfinishedEnd, in: String(tail.dropLast())) ? " " : ", "
                 text.removeLast()
-            } else if let last = text.last, !Self.matches(Self.unspacedBoundary, in: "\(last)\(first)") {
-                separator = " "
             }
             text += separator
         }
@@ -111,27 +105,35 @@ struct SentenceBatcher {
     }
 
     mutating func take(count: Int, language: Language) -> Batch? {
-        let ends = sentenceEnds(language: language)
+        let ends = Self.sentenceEnds(in: text, language: language)
         guard count > 0, ends.count >= count else { return nil }
         return consume(through: ends[count - 1])
     }
 
-    mutating func takeCompleted(language: Language) -> Batch? {
-        guard let end = sentenceEnds(language: language).last else { return nil }
-        return consume(through: end)
-    }
-
-    mutating func takeAtLimit(language: Language) -> Batch? {
-        if let completed = takeCompleted(language: language) { return completed }
-        let midpoint = text.index(text.startIndex, offsetBy: text.count / 2)
-        if let pause = text[midpoint...].lastIndex(where: { ",，;；、".contains($0) }) {
-            return consume(through: text.index(after: pause))
-        }
-        return flush()
-    }
-
     mutating func flush() -> Batch? {
         consume(through: text.endIndex)
+    }
+
+    static func separator(after last: Character?, before first: Character) -> String {
+        guard let last, !matches(unspacedBoundary, in: "\(last)\(first)") else { return "" }
+        return " "
+    }
+
+    static func previewParagraphs(_ text: String, count: Int, language: Language) -> [String] {
+        guard !text.isEmpty, count > 0 else { return [] }
+        let ends = sentenceEnds(in: text, language: language)
+        var paragraphs: [String] = []
+        var start = text.startIndex
+        for index in stride(from: count - 1, to: ends.count, by: count) {
+            let end = ends[index]
+            let remaining = text[end...].drop(while: \.isWhitespace)
+            // Open a new row when the next words arrive. A draft ending at punctuation needs no empty row.
+            guard !remaining.isEmpty else { break }
+            paragraphs.append(String(text[start..<end]))
+            start = remaining.startIndex
+        }
+        paragraphs.append(String(text[start...]))
+        return paragraphs
     }
 
     private mutating func consume(through end: String.Index) -> Batch? {
@@ -150,7 +152,7 @@ struct SentenceBatcher {
         return batch
     }
 
-    private func sentenceEnds(language: Language) -> [String.Index] {
+    private static func sentenceEnds(in text: String, language: Language) -> [String.Index] {
         var ends: [String.Index] = []
         var start = text.startIndex
         for match in Self.punctuation.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
@@ -185,17 +187,31 @@ struct SentenceBatcher {
 }
 
 struct TranscriptDrafts {
-    struct Draft: Identifiable, Equatable {
+    struct Draft: Equatable {
         let connection: UUID
         let item: String
         var text: String
-
-        var id: String { "\(connection):\(item)" }
     }
 
     struct Snapshot: Equatable {
         var unbound: [Draft] = []
         var bound: [UUID: String] = [:]
+
+        func paragraph(after waiting: String, pending: [Caption]) -> String {
+            var paragraph = ""
+            func append(_ chunk: String) {
+                let text = chunk.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+                guard let first = text.first else { return }
+                paragraph += SentenceBatcher.separator(after: paragraph.last, before: first)
+                paragraph += text
+            }
+            append(waiting)
+            for caption in pending {
+                append(caption.originalFinal || !caption.original.isEmpty ? caption.original : bound[caption.id] ?? "")
+            }
+            for draft in unbound { append(draft.text) }
+            return paragraph
+        }
     }
 
     private var unbound: [Draft] = []
