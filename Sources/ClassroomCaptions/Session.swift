@@ -39,11 +39,6 @@ final class ClassroomSession: ObservableObject {
         let enqueuedAt = ContinuousClock.now
     }
 
-    private struct DraftRow {
-        let firstSeenAt = ContinuousClock.now
-        var translation: DraftTranslation?
-    }
-
     private struct DraftWork {
         let id = UUID()
         let position: Int
@@ -84,11 +79,10 @@ final class ClassroomSession: ObservableObject {
     private var translationRefresh: Task<Void, Never>?
     private var workers: [UUID: Task<Void, Never>] = [:]
     private var translationQueue: [TranslationJob] = []
-    private var originalPreviews: [SentenceBatcher.Preview] = []
-    private var draftRows: [Int: DraftRow] = [:]
+    private var originalPreviews: [String] = []
+    private var draftTranslations: [Int: DraftTranslation] = [:]
     private var draftWork: DraftWork?
     private var draftTask: Task<Void, Never>?
-    private var draftCheck: Task<Void, Never>?
     private var sentenceBatch = SentenceBatcher()
     private var sentenceCount = SentenceBatcher.defaultCount
     private var batchContext: TranslationContext?
@@ -724,7 +718,6 @@ final class ClassroomSession: ObservableObject {
         recordingClock.pause()
         closeAll()
         cancelDraftTranslation()
-        cancelDraftCheck()
         submitted.removeAll()
         stopDeadline?.cancel()
         stopDeadline = nil
@@ -931,7 +924,7 @@ final class ClassroomSession: ObservableObject {
         var caption = Caption(recordingStartSeconds: batch.startSeconds, original: batch.text,
                               originalFinal: true, translationLanguage: context.target, originalLanguage: context.source)
         let position = nextCaptionPosition
-        let draft = draftRows.removeValue(forKey: position)?.translation
+        let draft = draftTranslations.removeValue(forKey: position)
         let activeDraft = draftWork?.position == position && draftWork?.captionID == nil
         let matches = draft?.matches(batch.text, target: context.target) == true
         if let draft, draft.coversStart(of: batch.text, target: context.target) {
@@ -970,15 +963,17 @@ final class ClassroomSession: ObservableObject {
         let text = drafts.snapshot().paragraph(after: sentenceBatch.text, pending: pendingOriginals)
         let language = batchContext?.source ?? pendingOriginals.first?.originalLanguage ?? active?.configuredSource ?? source
         originalPreviews = SentenceBatcher.previewParagraphs(text, count: sentenceCount, language: language)
-        let positions = nextCaptionPosition..<(nextCaptionPosition + originalPreviews.count)
-        draftRows = draftRows.filter { positions.contains($0.key) }
-        for position in positions where draftRows[position] == nil { draftRows[position] = DraftRow() }
+        let positions = nextCaptionPosition..<(nextCaptionPosition + draftablePreviews.count)
+        draftTranslations = draftTranslations.filter { positions.contains($0.key) }
         if let work = draftWork, work.captionID == nil, !positions.contains(work.position) {
             cancelDraftTranslation()
         }
         publishLiveParagraphs()
         startDraftTranslation()
     }
+
+    // The trailing row is still accepting new transcription, even when it ends in punctuation.
+    private var draftablePreviews: ArraySlice<String> { originalPreviews.dropLast() }
 
     private var previewTarget: Language {
         if !sentenceBatch.text.isEmpty, let batchContext { return batchContext.target }
@@ -989,9 +984,9 @@ final class ClassroomSession: ObservableObject {
         let target = previewTarget
         let paragraphs = originalPreviews.enumerated().map { offset, preview in
             let position = nextCaptionPosition + offset
-            let draft = draftRows[position]?.translation
-            let translated = draft?.coversStart(of: preview.text, target: target) == true ? draft?.displayedText ?? "" : ""
-            return LiveCaption(id: position, original: preview.text, translation: translated)
+            let draft = draftTranslations[position]
+            let translated = draft?.coversStart(of: preview, target: target) == true ? draft?.displayedText ?? "" : ""
+            return LiveCaption(id: position, original: preview, translation: translated)
         }
         if paragraphs != liveParagraphs { liveParagraphs = paragraphs }
     }
@@ -1000,34 +995,16 @@ final class ClassroomSession: ObservableObject {
         guard phase == .listening, draftWork == nil, translationQueue.isEmpty, workers.count < 4,
               let service = apis?.translation else { return }
         let target = previewTarget
-        let now = ContinuousClock.now
-        // Finish a full paragraph before refreshing a long, unfinished one.
-        let candidate = originalPreviews.indices.first { index in
-            let preview = originalPreviews[index]
-            let draft = draftRows[nextCaptionPosition + index]?.translation
-            return preview.fullBatch && draft?.matches(preview.text, target: target) != true
-        } ?? originalPreviews.indices.last.flatMap { index -> Int? in
-            let preview = originalPreviews[index]
-            guard !preview.fullBatch, preview.text.count >= 32, let row = draftRows[nextCaptionPosition + index] else { return nil }
-            var readyAt = row.firstSeenAt.advanced(by: .milliseconds(2500))
-            if let draft = row.translation, draft.target == target {
-                guard preview.text.count >= draft.original.count + 24 else { return nil }
-                readyAt = max(readyAt, draft.startedAt.advanced(by: .seconds(2)))
-            }
-            if now < readyAt {
-                scheduleDraftCheck(at: readyAt)
-                return nil
-            }
-            return index
-        }
-        guard let index = candidate else { return }
-        cancelDraftCheck()
-        let original = originalPreviews[index].text
+        guard let index = draftablePreviews.indices.first(where: { index in
+            let draft = draftTranslations[nextCaptionPosition + index]
+            return draft?.matches(originalPreviews[index], target: target) != true
+        }) else { return }
+        let original = originalPreviews[index]
         let work = DraftWork(position: nextCaptionPosition + index)
-        let old = draftRows[work.position]?.translation
+        let old = draftTranslations[work.position]
         let fallback = old?.coversStart(of: original, target: target) == true ? old?.displayedText ?? "" : ""
-        draftRows[work.position]?.translation = DraftTranslation(original: original, target: target, startedAt: now, fallback: fallback)
-        let previous = index > 0 ? originalPreviews[index - 1].text : captions.last { !$0.original.isEmpty }?.original
+        draftTranslations[work.position] = DraftTranslation(original: original, target: target, fallback: fallback)
+        let previous = index > 0 ? originalPreviews[index - 1] : captions.last { !$0.original.isEmpty }?.original
         draftWork = work
         AppLog.event("translation.preview.requested")
         draftTask = Task { [weak self] in
@@ -1051,7 +1028,7 @@ final class ClassroomSession: ObservableObject {
         if work.captionID != nil {
             draftWork?.promotedText += text
         } else {
-            draftRows[work.position]?.translation?.text += text
+            draftTranslations[work.position]?.text += text
         }
         scheduleTranslationRefresh()
     }
@@ -1069,8 +1046,8 @@ final class ClassroomSession: ObservableObject {
                 queueTranslation(captionID)
             }
         } else if let text {
-            draftRows[work.position]?.translation?.text = text
-            draftRows[work.position]?.translation?.completed = true
+            draftTranslations[work.position]?.text = text
+            draftTranslations[work.position]?.completed = true
         }
         publishLiveParagraphs()
         startDraftTranslation()
@@ -1080,21 +1057,6 @@ final class ClassroomSession: ObservableObject {
         draftTask?.cancel()
         draftTask = nil
         draftWork = nil
-    }
-
-    private func scheduleDraftCheck(at instant: ContinuousClock.Instant) {
-        guard draftCheck == nil else { return }
-        draftCheck = Task { [weak self] in
-            do { try await ContinuousClock().sleep(until: instant) }
-            catch { return }
-            self?.draftCheck = nil
-            self?.startDraftTranslation()
-        }
-    }
-
-    private func cancelDraftCheck() {
-        draftCheck?.cancel()
-        draftCheck = nil
     }
 
     private func scheduleOriginalRefresh() {
@@ -1191,8 +1153,7 @@ final class ClassroomSession: ObservableObject {
         batchTimer?.cancel()
         batchTimer = nil
         cancelDraftTranslation()
-        cancelDraftCheck()
-        draftRows.removeAll()
+        draftTranslations.removeAll()
         originalPreviews.removeAll()
         for worker in workers.values { worker.cancel() }
         workers.removeAll()

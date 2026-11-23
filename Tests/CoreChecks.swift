@@ -88,7 +88,7 @@ struct CoreChecks {
 
     private static func checkLiveParagraphBoundaries() {
         func paragraphs(_ text: String, count: Int, language: Language = .english) -> [String] {
-            SentenceBatcher.previewParagraphs(text, count: count, language: language).map(\.text)
+            SentenceBatcher.previewParagraphs(text, count: count, language: language)
         }
         let spoken = "The first sentence is ready. The second sentence has begun"
         precondition(paragraphs(spoken, count: 1) ==
@@ -102,10 +102,7 @@ struct CoreChecks {
         precondition(paragraphs(sentence, count: 1) == [sentence])
         precondition(paragraphs(sentence + " The next reading", count: 1) ==
             [sentence, "The next reading"])
-        precondition(SentenceBatcher.previewParagraphs(sentence, count: 1, language: .english).map(\.fullBatch) == [true])
-        precondition(SentenceBatcher.previewParagraphs(spoken, count: 1, language: .english).map(\.fullBatch) == [true, false])
-        precondition(SentenceBatcher.previewParagraphs(spoken, count: 2, language: .english).map(\.fullBatch) == [false])
-        precondition(SentenceBatcher.previewParagraphs("Dr. Tan measured 3.", count: 1, language: .english).map(\.fullBatch) == [false])
+        precondition(paragraphs("Dr. Tan measured 3.", count: 1) == ["Dr. Tan measured 3."])
         let incomplete = "If the reading rises. we will keep watching"
         precondition(paragraphs(incomplete, count: 1) == [incomplete])
         let revised = "The first sentence is ready, and the speaker continues"
@@ -115,7 +112,7 @@ struct CoreChecks {
 
     private static func checkDraftTranslationMatching() {
         var draft = DraftTranslation(original: "The temperature is high.", target: .simplified,
-                                     startedAt: .now, fallback: "初版")
+                                     fallback: "初版")
         precondition(draft.matches("The temperature\nis high.", target: .simplified))
         precondition(!draft.matches("The temperature is high.", target: .traditional))
         precondition(!draft.matches("The temperature is higher.", target: .simplified))
@@ -283,6 +280,22 @@ struct CoreChecks {
         style.color = CaptionRGB(red: 1, green: 0.8, blue: 0.1)
         let restored = try JSONDecoder().decode(CaptionTypography.self, from: JSONEncoder().encode(style))
         precondition(restored == style && CaptionTypography.translation.color == nil)
+
+        let colors = CaptionColors(originalColor: restored.color)
+        precondition(colors.original == CaptionColorSetting(choice: .custom, customColor: style.color))
+        precondition(colors.draft.choice == .mistBlue && colors.draft.choice.rgb?.hex == "#B5C9DE")
+        precondition(colors.final.choice == .automatic)
+        precondition(CaptionColorChoice.sage.rgb?.hex == "#BBCFBE")
+        precondition(CaptionRGB(hex: " #bBcfBe ") == CaptionColorChoice.sage.rgb)
+        precondition(CaptionRGB(hex: "000000")?.hex == "#000000")
+        for invalid in ["#123", "#12345678", "+12345", "#GGCFBE", "0xFF00", "#BB CFBE"] {
+            precondition(CaptionRGB(hex: invalid) == nil)
+        }
+        var custom = colors
+        custom.draft = CaptionColorSetting(choice: .custom, customColor: CaptionRGB(hex: "#BBCFBE"))
+        custom.final.choice = .white
+        let saved = try JSONDecoder().decode(CaptionColors.self, from: JSONEncoder().encode(custom))
+        precondition(saved == custom && saved.original.customColor == style.color)
     }
 
     private static func checkSpeechBoundaries() {

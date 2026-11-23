@@ -67,7 +67,6 @@ struct LiveCaption: Identifiable, Equatable {
 struct DraftTranslation {
     let original: String
     let target: Language
-    let startedAt: ContinuousClock.Instant
     let fallback: String
     var text = ""
     var completed = false
@@ -92,11 +91,6 @@ struct SentenceBatcher {
     struct Batch {
         let text: String
         let startSeconds: Int64?
-    }
-
-    struct Preview: Equatable {
-        let text: String
-        let fullBatch: Bool
     }
 
     private struct Fragment {
@@ -152,19 +146,18 @@ struct SentenceBatcher {
         return " "
     }
 
-    static func previewParagraphs(_ text: String, count: Int, language: Language) -> [Preview] {
+    static func previewParagraphs(_ text: String, count: Int, language: Language) -> [String] {
         guard !text.isEmpty, count > 0 else { return [] }
         let ends = sentenceEnds(in: text, language: language)
-        var paragraphs: [Preview] = []
+        var paragraphs: [String] = []
         var start = text.startIndex
         for index in stride(from: count - 1, to: ends.count, by: count) {
             let end = ends[index]
-            let uncertainNumber = end == text.endIndex && text.last == "." && text.dropLast().last?.isNumber == true
-            paragraphs.append(Preview(text: String(text[start..<end]), fullBatch: !uncertainNumber))
+            paragraphs.append(String(text[start..<end]))
             start = text[end...].drop(while: \.isWhitespace).startIndex
         }
         if start != text.endIndex {
-            paragraphs.append(Preview(text: String(text[start...]), fullBatch: false))
+            paragraphs.append(String(text[start...]))
         }
         return paragraphs
     }
@@ -430,6 +423,103 @@ struct CaptionRGB: Codable, Equatable {
     let red: Double
     let green: Double
     let blue: Double
+}
+
+extension CaptionRGB {
+    init(rgb: UInt32) {
+        self.init(red: Double((rgb >> 16) & 255) / 255,
+                  green: Double((rgb >> 8) & 255) / 255,
+                  blue: Double(rgb & 255) / 255)
+    }
+
+    init?(hex: String) {
+        let input = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+        let digits = input.hasPrefix("#") ? input.dropFirst() : input[...]
+        guard digits.utf8.count == 6, digits.utf8.allSatisfy({
+            (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+        }), let rgb = UInt32(digits, radix: 16) else { return nil }
+        self.init(rgb: rgb)
+    }
+
+    var hex: String {
+        func byte(_ value: Double) -> Int {
+            guard value.isFinite else { return 0 }
+            return Int((min(max(value, 0), 1) * 255).rounded())
+        }
+        return String(format: "#%02X%02X%02X", byte(red), byte(green), byte(blue))
+    }
+}
+
+enum CaptionColorChoice: String, Codable, CaseIterable, Identifiable {
+    case automatic, white, black, silver, blue, green, red, gold
+    case originalGray, deepGray, mistBlue, lavender, sand, sage, custom
+
+    var id: Self { self }
+
+    var label: String {
+        switch self {
+        case .automatic: "自动"
+        case .white: "白色"
+        case .black: "黑色"
+        case .silver: "银灰"
+        case .blue: "经典蓝"
+        case .green: "经典绿"
+        case .red: "经典红"
+        case .gold: "金黄"
+        case .originalGray: "同原文灰"
+        case .deepGray: "深一档灰"
+        case .mistBlue: "雾蓝灰"
+        case .lavender: "薰衣草灰"
+        case .sand: "暖沙灰"
+        case .sage: "鼠尾草灰"
+        case .custom: "自定义颜色"
+        }
+    }
+
+    var rgb: CaptionRGB? {
+        let value: UInt32
+        switch self {
+        case .white: value = 0xFFFFFF
+        case .black: value = 0x000000
+        case .silver: value = 0xD6DAE0
+        case .blue: value = 0x68A9FF
+        case .green: value = 0x7BD88F
+        case .red: value = 0xFF8585
+        case .gold: value = 0xFFD36E
+        case .deepGray: value = 0xB9BDC4
+        case .mistBlue: value = 0xB5C9DE
+        case .lavender: value = 0xC9BDDB
+        case .sand: value = 0xD5C6B0
+        case .sage: value = 0xBBCFBE
+        case .automatic, .originalGray, .custom: return nil
+        }
+        return CaptionRGB(rgb: value)
+    }
+}
+
+struct CaptionColorSetting: Codable, Equatable {
+    var choice: CaptionColorChoice = .automatic
+    var customColor: CaptionRGB?
+
+    init(choice: CaptionColorChoice = .automatic, customColor: CaptionRGB? = nil) {
+        self.choice = choice
+        self.customColor = customColor
+    }
+
+    init(legacyColor: CaptionRGB?) {
+        self.init(choice: legacyColor == nil ? .automatic : .custom, customColor: legacyColor)
+    }
+}
+
+struct CaptionColors: Codable, Equatable {
+    var original: CaptionColorSetting
+    var draft = CaptionColorSetting(choice: .mistBlue)
+    var final: CaptionColorSetting
+
+    init(originalColor: CaptionRGB? = nil, finalColor: CaptionRGB? = nil) {
+        original = CaptionColorSetting(legacyColor: originalColor)
+        final = CaptionColorSetting(legacyColor: finalColor)
+    }
 }
 
 struct CaptionScrollFollow {

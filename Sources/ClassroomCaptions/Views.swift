@@ -87,8 +87,16 @@ struct CaptionView: View {
 
     private var foreground: Color { preferences.panelForeground }
     private var languageShadow: Color { foreground == .black ? .black.opacity(0.65) : .clear }
-    private var originalColor: Color { preferences.originalTypography.color?.swiftUIColor ?? foreground.opacity(0.80) }
-    private var translationColor: Color { preferences.translationTypography.color?.swiftUIColor ?? foreground }
+    private var automaticOriginalColor: Color { foreground.opacity(0.80) }
+    private var originalColor: Color {
+        preferences.captionColors.original.resolved(automatic: automaticOriginalColor, original: automaticOriginalColor)
+    }
+    private var translationColor: Color {
+        preferences.captionColors.final.resolved(automatic: foreground, original: originalColor)
+    }
+    private var draftColor: Color {
+        preferences.captionColors.draft.resolved(automatic: automaticOriginalColor, original: originalColor)
+    }
 
     private var stateColor: Color {
         switch session.phase {
@@ -354,18 +362,12 @@ struct CaptionView: View {
     }
 
     private func translationLine(_ text: String, draft: Bool) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            if draft {
-                Text("草稿")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundStyle(translationColor.opacity(0.75))
-            }
-            Text(text)
-                .font(translationFont)
-                .foregroundStyle(translationColor)
-                .fixedSize(horizontal: false, vertical: true)
-                .textSelection(.enabled)
-        }
+        Text(text)
+            .font(translationFont)
+            .foregroundStyle(draft ? draftColor : translationColor)
+            .fixedSize(horizontal: false, vertical: true)
+            .textSelection(.enabled)
+            .accessibilityLabel(draft ? "译文草稿。\(text)" : text)
     }
 }
 
@@ -418,6 +420,107 @@ private extension CaptionTypography {
 
 private extension CaptionRGB {
     var swiftUIColor: Color { Color(.sRGB, red: red, green: green, blue: blue) }
+
+    init?(color: Color) {
+        guard let rgb = NSColor(color).usingColorSpace(.sRGB) else { return nil }
+        self.init(red: rgb.redComponent, green: rgb.greenComponent, blue: rgb.blueComponent)
+    }
+}
+
+private extension CaptionColorSetting {
+    func resolved(automatic: Color, original: Color) -> Color {
+        switch choice {
+        case .automatic: automatic
+        case .originalGray: original
+        case .custom: customColor?.swiftUIColor ?? automatic
+        default: choice.rgb?.swiftUIColor ?? automatic
+        }
+    }
+}
+
+private struct CaptionColorControls: View {
+    private final class HexEditor: ObservableObject {
+        @Published var text: String?
+    }
+
+    @StateObject private var editor = HexEditor()
+    let title: String
+    @Binding var setting: CaptionColorSetting
+    let automaticColor: Color
+    let originalColor: Color
+
+    private var color: Color { setting.resolved(automatic: automaticColor, original: originalColor) }
+    private var parsedHex: CaptionRGB? { editor.text.flatMap(CaptionRGB.init(hex:)) }
+
+    var body: some View {
+        LabeledContent(title) {
+            HStack(spacing: 7) {
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(color)
+                    .overlay { RoundedRectangle(cornerRadius: 3).strokeBorder(.secondary.opacity(0.45)) }
+                    .frame(width: 16, height: 12)
+                    .accessibilityHidden(true)
+                Picker(title, selection: Binding(get: { setting.choice }, set: selectColor)) {
+                    ForEach(CaptionColorChoice.allCases) { choice in
+                        Text(choice.label).tag(choice)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .fixedSize()
+            }
+        }
+        .settingsHelp("选择预设或「自定义颜色」。更改会立即显示在字幕窗。")
+        if setting.choice == .custom {
+            ColorPicker("调色盘", selection: Binding(get: { color }, set: applyPickerColor), supportsOpacity: false)
+                .accessibilityLabel("\(title)调色盘")
+                .settingsHelp("点击色块打开系统调色盘。")
+            LabeledContent("色值") {
+                HStack(spacing: 8) {
+                    TextField("色值", text: Binding(
+                        get: { editor.text ?? setting.customColor?.hex ?? "" },
+                        set: { editor.text = $0 }
+                    ), prompt: Text("#BBCFBE"))
+                    .textFieldStyle(.roundedBorder)
+                    .monospaced()
+                    .frame(width: 106)
+                    .accessibilityLabel("\(title)色值")
+                    .onSubmit(applyHex)
+                    Button("应用", action: applyHex)
+                        .disabled(parsedHex == nil)
+                        .accessibilityLabel("应用\(title)色值")
+                }
+            }
+            .settingsHelp("输入六位十六进制色值，例如 #BBCFBE，按回车或点击「应用」。")
+            if let text = editor.text, !text.isEmpty, parsedHex == nil {
+                Text("请输入六位十六进制色值，例如 #BBCFBE。")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func selectColor(_ choice: CaptionColorChoice) {
+        var updated = setting
+        if choice == .custom, updated.customColor == nil {
+            updated.customColor = CaptionRGB(color: color)
+        }
+        updated.choice = choice
+        setting = updated
+        editor.text = nil
+    }
+
+    private func applyPickerColor(_ color: Color) {
+        guard let rgb = CaptionRGB(color: color) else { return }
+        setting.customColor = rgb
+        editor.text = nil
+    }
+
+    private func applyHex() {
+        guard let parsedHex else { return }
+        setting.customColor = parsedHex
+        editor.text = nil
+    }
 }
 
 @MainActor
@@ -640,10 +743,20 @@ struct SettingsView: View {
                 .settingsHelp("向左调低可让字幕窗背景更透明。")
             }
             Section("原文字幕字体") {
-                fontControls($preferences.originalTypography, colorLabel: "原文字体颜色")
+                fontControls($preferences.originalTypography)
             }
             Section("译文字幕字体") {
-                fontControls($preferences.translationTypography, colorLabel: "译文字体颜色")
+                fontControls($preferences.translationTypography)
+            }
+            Section("字幕颜色") {
+                let automaticOriginal = preferences.panelForeground.opacity(0.80)
+                let original = preferences.captionColors.original.resolved(automatic: automaticOriginal, original: automaticOriginal)
+                CaptionColorControls(title: "原文颜色", setting: $preferences.captionColors.original,
+                                     automaticColor: automaticOriginal, originalColor: automaticOriginal)
+                CaptionColorControls(title: "译文草稿颜色", setting: $preferences.captionColors.draft,
+                                     automaticColor: automaticOriginal, originalColor: original)
+                CaptionColorControls(title: "正式译文颜色", setting: $preferences.captionColors.final,
+                                     automaticColor: preferences.panelForeground, originalColor: original)
             }
             Section("转写") {
                 TextField("转写 API 地址", text: $preferences.transcriptionAddress, prompt: Text(APIEndpoint.openAI.absoluteString))
@@ -792,7 +905,7 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private func fontControls(_ style: Binding<CaptionTypography>, colorLabel: String) -> some View {
+    private func fontControls(_ style: Binding<CaptionTypography>) -> some View {
         Picker("字体样式", selection: style.design) {
             ForEach(CaptionFontDesign.allCases) { Text($0.label).tag($0) }
         }
@@ -805,19 +918,6 @@ struct SettingsView: View {
             .settingsHelp("用粗体显示字幕。")
         Toggle("斜体", isOn: style.italic)
             .settingsHelp("用斜体显示字幕。")
-        ColorPicker(colorLabel, selection: Binding(
-            get: { style.wrappedValue.color?.swiftUIColor ?? preferences.panelForeground },
-            set: { input in
-                if let rgb = NSColor(input).usingColorSpace(.sRGB) {
-                    style.wrappedValue.color = CaptionRGB(red: rgb.redComponent, green: rgb.greenComponent, blue: rgb.blueComponent)
-                }
-            }
-        ), supportsOpacity: false)
-        .settingsHelp("为这组字幕指定文字颜色。")
-        if style.wrappedValue.color != nil {
-            Button("恢复自动颜色") { style.wrappedValue.color = nil }
-                .settingsHelp("根据字幕窗背景自动选择易读的文字颜色。")
-        }
     }
 
 }

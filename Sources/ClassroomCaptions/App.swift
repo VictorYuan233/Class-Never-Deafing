@@ -121,6 +121,14 @@ final class Preferences: ObservableObject {
     @Published var translationTypography = Preferences.loadTypography("translationTypography", fallback: .translation) {
         didSet { saveTypography(translationTypography, key: "translationTypography") }
     }
+    private static let captionColorsKey = "captionColors"
+    @Published var captionColors = Preferences.loadCaptionColors() {
+        didSet {
+            if let data = try? JSONEncoder().encode(captionColors) {
+                UserDefaults.standard.set(data, forKey: Self.captionColorsKey)
+            }
+        }
+    }
 
     func refreshAudioInputs() {
         audioInputs = AudioInput.devices()
@@ -131,6 +139,15 @@ final class Preferences: ObservableObject {
               var value = try? JSONDecoder().decode(CaptionTypography.self, from: data) else { return fallback }
         value.size = min(max(value.size, CaptionTypography.sizes.lowerBound), CaptionTypography.sizes.upperBound)
         return value
+    }
+
+    private static func loadCaptionColors() -> CaptionColors {
+        if let data = UserDefaults.standard.data(forKey: captionColorsKey),
+           let colors = try? JSONDecoder().decode(CaptionColors.self, from: data) {
+            return colors
+        }
+        return CaptionColors(originalColor: loadTypography("originalTypography", fallback: .original).color,
+                             finalColor: loadTypography("translationTypography", fallback: .translation).color)
     }
 
     private func saveTypography(_ value: CaptionTypography, key: String) {
