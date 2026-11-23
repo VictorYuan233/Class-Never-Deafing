@@ -21,6 +21,7 @@ struct CoreChecks {
         checkTranscriptDrafts()
         checkLiveParagraph()
         checkLiveParagraphBoundaries()
+        checkDraftTranslationMatching()
         checkFailureRows()
         checkSoundActivity()
         try await checkSystemAudioConversion()
@@ -86,24 +87,43 @@ struct CoreChecks {
     }
 
     private static func checkLiveParagraphBoundaries() {
+        func paragraphs(_ text: String, count: Int, language: Language = .english) -> [String] {
+            SentenceBatcher.previewParagraphs(text, count: count, language: language).map(\.text)
+        }
         let spoken = "The first sentence is ready. The second sentence has begun"
-        precondition(SentenceBatcher.previewParagraphs(spoken, count: 1, language: .english) ==
+        precondition(paragraphs(spoken, count: 1) ==
             ["The first sentence is ready.", "The second sentence has begun"])
-        precondition(SentenceBatcher.previewParagraphs(spoken, count: 2, language: .english) == [spoken])
+        precondition(paragraphs(spoken, count: 2) == [spoken])
         let continued = spoken + ". The third sentence is"
-        precondition(SentenceBatcher.previewParagraphs(continued, count: 2, language: .english) ==
+        precondition(paragraphs(continued, count: 2) ==
             [spoken + ".", "The third sentence is"])
 
         let sentence = "Dr. Tan measured 3.14 hertz."
-        precondition(SentenceBatcher.previewParagraphs(sentence, count: 1, language: .english) == [sentence])
-        precondition(SentenceBatcher.previewParagraphs(sentence + " The next reading", count: 1, language: .english) ==
+        precondition(paragraphs(sentence, count: 1) == [sentence])
+        precondition(paragraphs(sentence + " The next reading", count: 1) ==
             [sentence, "The next reading"])
+        precondition(SentenceBatcher.previewParagraphs(sentence, count: 1, language: .english).map(\.fullBatch) == [true])
+        precondition(SentenceBatcher.previewParagraphs(spoken, count: 1, language: .english).map(\.fullBatch) == [true, false])
+        precondition(SentenceBatcher.previewParagraphs(spoken, count: 2, language: .english).map(\.fullBatch) == [false])
+        precondition(SentenceBatcher.previewParagraphs("Dr. Tan measured 3.", count: 1, language: .english).map(\.fullBatch) == [false])
         let incomplete = "If the reading rises. we will keep watching"
-        precondition(SentenceBatcher.previewParagraphs(incomplete, count: 1, language: .english) == [incomplete])
+        precondition(paragraphs(incomplete, count: 1) == [incomplete])
         let revised = "The first sentence is ready, and the speaker continues"
-        precondition(SentenceBatcher.previewParagraphs(revised, count: 1, language: .english) == [revised])
-        precondition(SentenceBatcher.previewParagraphs("第一句好了。第二句正在说", count: 1, language: .simplified) ==
-            ["第一句好了。", "第二句正在说"])
+        precondition(paragraphs(revised, count: 1) == [revised])
+        precondition(paragraphs("第一句好了。第二句正在说", count: 1, language: .simplified) == ["第一句好了。", "第二句正在说"])
+    }
+
+    private static func checkDraftTranslationMatching() {
+        var draft = DraftTranslation(original: "The temperature is high.", target: .simplified,
+                                     startedAt: .now, fallback: "初版")
+        precondition(draft.matches("The temperature\nis high.", target: .simplified))
+        precondition(!draft.matches("The temperature is high.", target: .traditional))
+        precondition(!draft.matches("The temperature is higher.", target: .simplified))
+        precondition(draft.coversStart(of: "The temperature is higher.", target: .simplified))
+        precondition(!draft.coversStart(of: "Snow showers are expected.", target: .simplified))
+        precondition(draft.displayedText == "初版")
+        draft.text = "新译文"
+        precondition(draft.displayedText == "新译文")
     }
 
     private static func checkFailureRows() {

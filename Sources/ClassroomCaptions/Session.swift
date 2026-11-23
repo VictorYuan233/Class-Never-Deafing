@@ -39,10 +39,22 @@ final class ClassroomSession: ObservableObject {
         let enqueuedAt = ContinuousClock.now
     }
 
+    private struct DraftRow {
+        let firstSeenAt = ContinuousClock.now
+        var translation: DraftTranslation?
+    }
+
+    private struct DraftWork {
+        let id = UUID()
+        let position: Int
+        var captionID: UUID?
+        var promotedText = ""
+    }
+
     @Published private(set) var phase = Phase.idle
     @Published private(set) var status = "准备就绪"
     @Published private(set) var captions: [Caption] = []
-    @Published private(set) var liveParagraphs: [String] = []
+    @Published private(set) var liveParagraphs: [LiveCaption] = []
     @Published private(set) var markers: [RecordingMarker] = []
     @Published private(set) var notice: String?
     @Published private(set) var recordingClock = RecordingClock()
@@ -72,6 +84,11 @@ final class ClassroomSession: ObservableObject {
     private var translationRefresh: Task<Void, Never>?
     private var workers: [UUID: Task<Void, Never>] = [:]
     private var translationQueue: [TranslationJob] = []
+    private var originalPreviews: [SentenceBatcher.Preview] = []
+    private var draftRows: [Int: DraftRow] = [:]
+    private var draftWork: DraftWork?
+    private var draftTask: Task<Void, Never>?
+    private var draftCheck: Task<Void, Never>?
     private var sentenceBatch = SentenceBatcher()
     private var sentenceCount = SentenceBatcher.defaultCount
     private var batchContext: TranslationContext?
@@ -513,10 +530,11 @@ final class ClassroomSession: ObservableObject {
             resolveRealtime(id, text: nil)
         }
         while !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty || !workers.isEmpty ||
-                !translationQueue.isEmpty || !sentenceBatch.text.isEmpty {
+                !translationQueue.isEmpty || !sentenceBatch.text.isEmpty || draftWork?.captionID != nil {
             if Task.isCancelled { break }
             if recoveryWorkers.isEmpty && recoveryQueue.isEmpty && !sentenceBatch.text.isEmpty {
                 flushSentenceBatch()
+                publishOriginal()
             }
             if phase == .stopping {
                 let pendingRecovery = !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty
@@ -532,6 +550,7 @@ final class ClassroomSession: ObservableObject {
         active = nil
         if pendingOriginals.isEmpty { flushSentenceBatch() }
         phase = .paused
+        publishOriginal()
         status = pausedForSilence ? "无声超时，已自动暂停" : "已暂停"
     }
 
@@ -704,6 +723,8 @@ final class ClassroomSession: ObservableObject {
         cancelSilencePause()
         recordingClock.pause()
         closeAll()
+        cancelDraftTranslation()
+        cancelDraftCheck()
         submitted.removeAll()
         stopDeadline?.cancel()
         stopDeadline = nil
@@ -849,6 +870,7 @@ final class ClassroomSession: ObservableObject {
             collectSentences(from: next)
         }
         if pendingOriginals.isEmpty, phase == .paused { flushSentenceBatch() }
+        // Reconcile ready captions before pruning the preview rows they can reuse.
         publishOriginal()
     }
 
@@ -894,6 +916,7 @@ final class ClassroomSession: ObservableObject {
         let idle = (capture?.lastHeardAt ?? batchUpdatedAt).duration(to: SuspendingClock().now)
         guard phase == .paused || idle >= .seconds(5) else { return false }
         flushSentenceBatch()
+        publishOriginal()
         return true
     }
 
@@ -902,14 +925,31 @@ final class ClassroomSession: ObservableObject {
         batchTimer = nil
         if let context = batchContext, let batch = sentenceBatch.flush() { submitBatch(batch, context: context) }
         batchContext = nil
-        publishOriginal()
     }
 
     private func submitBatch(_ batch: SentenceBatcher.Batch, context: TranslationContext) {
-        let caption = Caption(recordingStartSeconds: batch.startSeconds, original: batch.text,
+        var caption = Caption(recordingStartSeconds: batch.startSeconds, original: batch.text,
                               originalFinal: true, translationLanguage: context.target, originalLanguage: context.source)
+        let position = nextCaptionPosition
+        let draft = draftRows.removeValue(forKey: position)?.translation
+        let activeDraft = draftWork?.position == position && draftWork?.captionID == nil
+        let matches = draft?.matches(batch.text, target: context.target) == true
+        if let draft, draft.coversStart(of: batch.text, target: context.target) {
+            caption.translation = draft.displayedText
+            caption.translationFinal = matches && draft.completed
+            caption.translationIsDraft = !caption.translationFinal && !caption.translation.isEmpty
+        }
+        if activeDraft {
+            if matches {
+                draftWork?.captionID = caption.id
+                draftWork?.promotedText = draft?.text ?? ""
+                caption.translationIsDraft = true
+            } else {
+                cancelDraftTranslation()
+            }
+        }
         appendCaption(caption)
-        queueTranslation(caption.id)
+        if !caption.translationFinal, draftWork?.captionID != caption.id { queueTranslation(caption.id) }
     }
 
     private func appendCaption(_ original: Caption) {
@@ -929,8 +969,132 @@ final class ClassroomSession: ObservableObject {
     private func publishOriginal() {
         let text = drafts.snapshot().paragraph(after: sentenceBatch.text, pending: pendingOriginals)
         let language = batchContext?.source ?? pendingOriginals.first?.originalLanguage ?? active?.configuredSource ?? source
-        let paragraphs = SentenceBatcher.previewParagraphs(text, count: sentenceCount, language: language)
+        originalPreviews = SentenceBatcher.previewParagraphs(text, count: sentenceCount, language: language)
+        let positions = nextCaptionPosition..<(nextCaptionPosition + originalPreviews.count)
+        draftRows = draftRows.filter { positions.contains($0.key) }
+        for position in positions where draftRows[position] == nil { draftRows[position] = DraftRow() }
+        if let work = draftWork, work.captionID == nil, !positions.contains(work.position) {
+            cancelDraftTranslation()
+        }
+        publishLiveParagraphs()
+        startDraftTranslation()
+    }
+
+    private var previewTarget: Language {
+        if !sentenceBatch.text.isEmpty, let batchContext { return batchContext.target }
+        return pendingOriginals.first?.translationLanguage ?? target
+    }
+
+    private func publishLiveParagraphs() {
+        let target = previewTarget
+        let paragraphs = originalPreviews.enumerated().map { offset, preview in
+            let position = nextCaptionPosition + offset
+            let draft = draftRows[position]?.translation
+            let translated = draft?.coversStart(of: preview.text, target: target) == true ? draft?.displayedText ?? "" : ""
+            return LiveCaption(id: position, original: preview.text, translation: translated)
+        }
         if paragraphs != liveParagraphs { liveParagraphs = paragraphs }
+    }
+
+    private func startDraftTranslation() {
+        guard phase == .listening, draftWork == nil, translationQueue.isEmpty, workers.count < 4,
+              let service = apis?.translation else { return }
+        let target = previewTarget
+        let now = ContinuousClock.now
+        // Finish a full paragraph before refreshing a long, unfinished one.
+        let candidate = originalPreviews.indices.first { index in
+            let preview = originalPreviews[index]
+            let draft = draftRows[nextCaptionPosition + index]?.translation
+            return preview.fullBatch && draft?.matches(preview.text, target: target) != true
+        } ?? originalPreviews.indices.last.flatMap { index -> Int? in
+            let preview = originalPreviews[index]
+            guard !preview.fullBatch, preview.text.count >= 32, let row = draftRows[nextCaptionPosition + index] else { return nil }
+            var readyAt = row.firstSeenAt.advanced(by: .milliseconds(2500))
+            if let draft = row.translation, draft.target == target {
+                guard preview.text.count >= draft.original.count + 24 else { return nil }
+                readyAt = max(readyAt, draft.startedAt.advanced(by: .seconds(2)))
+            }
+            if now < readyAt {
+                scheduleDraftCheck(at: readyAt)
+                return nil
+            }
+            return index
+        }
+        guard let index = candidate else { return }
+        cancelDraftCheck()
+        let original = originalPreviews[index].text
+        let work = DraftWork(position: nextCaptionPosition + index)
+        let old = draftRows[work.position]?.translation
+        let fallback = old?.coversStart(of: original, target: target) == true ? old?.displayedText ?? "" : ""
+        draftRows[work.position]?.translation = DraftTranslation(original: original, target: target, startedAt: now, fallback: fallback)
+        let previous = index > 0 ? originalPreviews[index - 1].text : captions.last { !$0.original.isEmpty }?.original
+        draftWork = work
+        AppLog.event("translation.preview.requested")
+        draftTask = Task { [weak self] in
+            do {
+                try Task.checkCancellation()
+                let text = try await TranslationAPI.shared.translate(original, to: target, service: service, previous: previous,
+                                                                      draft: true) { [weak self] delta in
+                    self?.receiveDraftDelta(delta, id: work.id)
+                }
+                self?.finishDraftTranslation(id: work.id, text: text)
+            } catch {
+                guard !Task.isCancelled else { return }
+                AppLog.failure("translation.preview.failed", error)
+                self?.finishDraftTranslation(id: work.id, text: nil)
+            }
+        }
+    }
+
+    private func receiveDraftDelta(_ text: String, id: UUID) {
+        guard let work = draftWork, work.id == id else { return }
+        if work.captionID != nil {
+            draftWork?.promotedText += text
+        } else {
+            draftRows[work.position]?.translation?.text += text
+        }
+        scheduleTranslationRefresh()
+    }
+
+    private func finishDraftTranslation(id: UUID, text: String?) {
+        guard let work = draftWork, work.id == id else { return }
+        draftWork = nil
+        draftTask = nil
+        if let captionID = work.captionID, let index = indices[captionID] {
+            if let text {
+                captions[index].translation = text
+                captions[index].translationFinal = true
+                captions[index].translationIsDraft = false
+            } else {
+                queueTranslation(captionID)
+            }
+        } else if let text {
+            draftRows[work.position]?.translation?.text = text
+            draftRows[work.position]?.translation?.completed = true
+        }
+        publishLiveParagraphs()
+        startDraftTranslation()
+    }
+
+    private func cancelDraftTranslation() {
+        draftTask?.cancel()
+        draftTask = nil
+        draftWork = nil
+    }
+
+    private func scheduleDraftCheck(at instant: ContinuousClock.Instant) {
+        guard draftCheck == nil else { return }
+        draftCheck = Task { [weak self] in
+            do { try await ContinuousClock().sleep(until: instant) }
+            catch { return }
+            self?.draftCheck = nil
+            self?.startDraftTranslation()
+        }
+    }
+
+    private func cancelDraftCheck() {
+        draftCheck?.cancel()
+        draftCheck = nil
     }
 
     private func scheduleOriginalRefresh() {
@@ -954,10 +1118,20 @@ final class ClassroomSession: ObservableObject {
 
     private func publishTranslations() {
         translationRefresh = nil
+        publishLiveParagraphs()
+        if let work = draftWork, let id = work.captionID, let index = indices[id], !work.promotedText.isEmpty,
+           captions[index].translation != work.promotedText {
+            captions[index].translation = work.promotedText
+        }
         guard !translationDeltas.isEmpty else { return }
         var updated = captions
         for (id, delta) in translationDeltas {
-            if let index = indices[id] { updated[index].translation += delta }
+            guard let index = indices[id] else { continue }
+            if updated[index].translationIsDraft {
+                updated[index].translation = ""
+                updated[index].translationIsDraft = false
+            }
+            updated[index].translation += delta
         }
         translationDeltas.removeAll(keepingCapacity: true)
         captions = updated
@@ -972,7 +1146,7 @@ final class ClassroomSession: ObservableObject {
             let previous = captions[..<index].last { $0.originalFinal && !$0.original.isEmpty }?.original
             let language = captions[index].translationLanguage
             if captions[index].translationFailed {
-                captions[index].translation = ""
+                if !captions[index].translationIsDraft { captions[index].translation = "" }
                 captions[index].translationFailed = false
             }
             workers[id] = Task {
@@ -980,6 +1154,7 @@ final class ClassroomSession: ObservableObject {
                     if !Task.isCancelled {
                         workers.removeValue(forKey: id)
                         startQueuedTranslations()
+                        startDraftTranslation()
                     }
                 }
                 do {
@@ -995,13 +1170,14 @@ final class ClassroomSession: ObservableObject {
                     if let index = indices[id] {
                         captions[index].translation = text
                         captions[index].translationFinal = true
+                        captions[index].translationIsDraft = false
                         storedPositions.remove(captions[index].position)
                     }
                 } catch {
                     translationDeltas.removeValue(forKey: id)
                     if !Task.isCancelled, let index = indices[id] {
                         AppLog.failure("translation.failed", error)
-                        captions[index].translation = ""
+                        if !captions[index].translationIsDraft { captions[index].translation = "" }
                         captions[index].translationFailed = true
                         storedPositions.remove(captions[index].position)
                         notice = description(for: error)
@@ -1014,6 +1190,10 @@ final class ClassroomSession: ObservableObject {
     private func cancelTranslations() {
         batchTimer?.cancel()
         batchTimer = nil
+        cancelDraftTranslation()
+        cancelDraftCheck()
+        draftRows.removeAll()
+        originalPreviews.removeAll()
         for worker in workers.values { worker.cancel() }
         workers.removeAll()
         translationQueue.removeAll()

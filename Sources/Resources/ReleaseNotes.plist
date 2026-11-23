@@ -3,10 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.0.12</string>
+    <string>1.0.13</string>
     <key>highlights</key>
     <array>
-        <string>后续音频约每 40 毫秒发送一包，GPT-Live-Transcribe 使用 minimal 延迟模式。</string>
+        <string>原文定稿前可显示译文草稿。原文未变时复用译文，有改动时在原处更新。</string>
+        <string>长句持续更新时先预译听到的内容，积累更多原文后刷新。</string>
     </array>
 </dict>
 </plist>

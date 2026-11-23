@@ -266,14 +266,19 @@ struct CaptionView: View {
         return ceil(font.ascender - font.descender + font.leading)
     }
 
-    private func liveOriginal(_ text: String) -> some View {
-        Text(text)
-            .font(originalFont)
-            .foregroundStyle(originalColor)
-            .fixedSize(horizontal: false, vertical: true)
-            .textSelection(.enabled)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .accessibilityIdentifier("liveOriginal")
+    private func liveCaptionRow(_ caption: LiveCaption) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(caption.original)
+                .font(originalFont)
+                .foregroundStyle(originalColor)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+                .accessibilityIdentifier("liveOriginal")
+            if !caption.translation.isEmpty {
+                translationLine(caption.translation, draft: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var transcript: some View {
@@ -285,9 +290,8 @@ struct CaptionView: View {
                             ForEach(Caption.visibleRows(session.visibleCaptions)) { caption in
                                 captionRow(caption)
                             }
-                            let liveParagraphs = session.liveParagraphs
-                            ForEach(liveParagraphs.indices, id: \.self) { index in
-                                liveOriginal(liveParagraphs[index])
+                            ForEach(session.liveParagraphs) { caption in
+                                liveCaptionRow(caption)
                             }
                         }
                         .padding(.horizontal, 18)
@@ -333,16 +337,13 @@ struct CaptionView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             if !caption.translation.isEmpty {
-                Text(caption.translation)
-                    .font(translationFont)
-                    .foregroundStyle(translationColor)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-            } else if caption.translationFailed {
+                translationLine(caption.translation, draft: caption.translationIsDraft)
+            }
+            if caption.translationFailed {
                 Button("翻译未完成 · 重试") { session.retryTranslation(caption.id) }
                     .font(.system(size: 12, weight: .medium))
                     .overlay(alignment: .bottom) { Rectangle().frame(height: 1).opacity(0.45) }
-            } else if caption.originalFinal && !caption.original.isEmpty {
+            } else if caption.translation.isEmpty && caption.originalFinal && !caption.original.isEmpty {
                 Text("正在翻译…")
                     .font(.system(size: 12))
                     .foregroundStyle(foreground.opacity(0.65))
@@ -350,6 +351,21 @@ struct CaptionView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityElement(children: .combine)
+    }
+
+    private func translationLine(_ text: String, draft: Bool) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            if draft {
+                Text("草稿")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(translationColor.opacity(0.75))
+            }
+            Text(text)
+                .font(translationFont)
+                .foregroundStyle(translationColor)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
     }
 }
 

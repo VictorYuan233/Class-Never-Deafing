@@ -300,6 +300,7 @@ actor TranslationAPI {
         to target: Language,
         service: TranslationService,
         previous: String?,
+        draft: Bool = false,
         onDelta: @MainActor @Sendable (String) -> Void
     ) async throws -> String {
         let model = service.model
@@ -309,6 +310,8 @@ actor TranslationAPI {
 
         request.httpBody = try Self.requestBody(original, to: target, model: model, previous: previous, format: service.format)
         let startedAt = ContinuousClock.now
+        let firstTextMetric: StaticString = draft ? "translation.preview.first_text_ms" : "translation.first_text_ms"
+        let completeMetric: StaticString = draft ? "translation.preview.complete_ms" : "translation.complete_ms"
         let (bytes, response) = try await session.bytes(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             AppLog.event("openai.translation.http_error", number: http.statusCode)
@@ -327,7 +330,7 @@ actor TranslationAPI {
             let payload = line.dropFirst(5).trimmingCharacters(in: .whitespaces)
             if service.format == .chat, payload == "[DONE]" {
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { break }
-                AppLog.latency("translation.complete_ms", since: startedAt)
+                AppLog.latency(completeMetric, since: startedAt)
                 return text
             }
             let data = Data(payload.utf8)
@@ -340,7 +343,7 @@ actor TranslationAPI {
                 }
                 if choice?["finish_reason"] as? String == "stop" { chatFinished = true }
                 if let delta = choice?["delta"] as? [String: Any], let content = delta["content"] as? String, !content.isEmpty {
-                    if text.isEmpty { AppLog.latency("translation.first_text_ms", since: startedAt) }
+                    if text.isEmpty { AppLog.latency(firstTextMetric, since: startedAt) }
                     text += content
                     await onDelta(content)
                 }
@@ -352,7 +355,7 @@ actor TranslationAPI {
                 if let delta = event["delta"] as? String, !delta.isEmpty {
                     if !reportedFirstText {
                         reportedFirstText = true
-                        AppLog.latency("translation.first_text_ms", since: startedAt)
+                        AppLog.latency(firstTextMetric, since: startedAt)
                     }
                     text += delta
                     await onDelta(delta)
@@ -363,7 +366,7 @@ actor TranslationAPI {
                 guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     throw AppFailure.api("翻译未返回文字。", retryable: true)
                 }
-                AppLog.latency("translation.complete_ms", since: startedAt)
+                AppLog.latency(completeMetric, since: startedAt)
                 if model.serviceTier != nil, let response = event["response"] as? [String: Any],
                    let tier = response["service_tier"] as? String {
                     AppLog.event(tier == "fast" || tier == "priority"
@@ -379,7 +382,7 @@ actor TranslationAPI {
             }
         }
         if chatFinished, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            AppLog.latency("translation.complete_ms", since: startedAt)
+            AppLog.latency(completeMetric, since: startedAt)
             return text
         }
         throw AppFailure.api("翻译响应中断。", retryable: true)

@@ -37,6 +37,7 @@ struct Caption: Identifiable {
     var translation = ""
     var originalFinal = false
     var translationFinal = false
+    var translationIsDraft = false
     var originalFailed = false
     var translationFailed = false
     var translationLanguage = Language.simplified
@@ -57,6 +58,33 @@ struct Caption: Identifiable {
     }
 }
 
+struct LiveCaption: Identifiable, Equatable {
+    let id: Int
+    let original: String
+    let translation: String
+}
+
+struct DraftTranslation {
+    let original: String
+    let target: Language
+    let startedAt: ContinuousClock.Instant
+    let fallback: String
+    var text = ""
+    var completed = false
+
+    var displayedText: String { text.isEmpty ? fallback : text }
+
+    func matches(_ text: String, target: Language) -> Bool {
+        self.target == target && original == text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    func coversStart(of text: String, target: Language) -> Bool {
+        guard self.target == target else { return false }
+        let normalized = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        return normalized.hasPrefix(original) || original.commonPrefix(with: normalized).count >= 12
+    }
+}
+
 struct SentenceBatcher {
     static let counts = 1...5
     static let defaultCount = 1
@@ -64,6 +92,11 @@ struct SentenceBatcher {
     struct Batch {
         let text: String
         let startSeconds: Int64?
+    }
+
+    struct Preview: Equatable {
+        let text: String
+        let fullBatch: Bool
     }
 
     private struct Fragment {
@@ -119,20 +152,20 @@ struct SentenceBatcher {
         return " "
     }
 
-    static func previewParagraphs(_ text: String, count: Int, language: Language) -> [String] {
+    static func previewParagraphs(_ text: String, count: Int, language: Language) -> [Preview] {
         guard !text.isEmpty, count > 0 else { return [] }
         let ends = sentenceEnds(in: text, language: language)
-        var paragraphs: [String] = []
+        var paragraphs: [Preview] = []
         var start = text.startIndex
         for index in stride(from: count - 1, to: ends.count, by: count) {
             let end = ends[index]
-            let remaining = text[end...].drop(while: \.isWhitespace)
-            // Open a new row when the next words arrive. A draft ending at punctuation needs no empty row.
-            guard !remaining.isEmpty else { break }
-            paragraphs.append(String(text[start..<end]))
-            start = remaining.startIndex
+            let uncertainNumber = end == text.endIndex && text.last == "." && text.dropLast().last?.isNumber == true
+            paragraphs.append(Preview(text: String(text[start..<end]), fullBatch: !uncertainNumber))
+            start = text[end...].drop(while: \.isWhitespace).startIndex
         }
-        paragraphs.append(String(text[start...]))
+        if start != text.endIndex {
+            paragraphs.append(Preview(text: String(text[start...]), fullBatch: false))
+        }
         return paragraphs
     }
 
