@@ -299,7 +299,7 @@ enum TranscriptionModel: String, CaseIterable, Identifiable {
 
     var help: String {
         switch self {
-        case .live: "通过 Realtime 接口边听边显示原文。"
+        case .live: "通过 Realtime 接口边听边显示原文，使用 minimal 延迟模式。"
         case .committed: "通过 Realtime 接口，在每段音频提交后返回原文。"
         case .custom: "每段结束后通过服务商的 /audio/transcriptions 接口转写。"
         }

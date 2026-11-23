@@ -39,7 +39,7 @@ struct QueuedAudioEvent {
 }
 
 struct AudioPacketBatcher {
-    static let packetBytes = 4 * SpeechSegmenter.bytesPerFrame
+    static let packetBytes = 2 * SpeechSegmenter.bytesPerFrame
     private var isFirstPacket = true
     private var buffered = Data()
     private var bufferedAt: ContinuousClock.Instant?
@@ -358,7 +358,8 @@ final class AudioProcessor: @unchecked Sendable {
     let queue = DispatchQueue(label: "classroom-captions.audio", qos: .userInitiated)
     private let slots = DispatchSemaphore(value: 24)
     // Keep roughly the former queue duration with 80 ms packets.
-    private let stream = AudioEvents.makeStream(bufferingPolicy: .bufferingOldest(210))
+    // Keep about the same audio duration queued with 40 ms packets.
+    private let stream = AudioEvents.makeStream(bufferingPolicy: .bufferingOldest(420))
     private let output = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: Double(SpeechSegmenter.sampleRate),
                                        channels: 1, interleaved: true)!
     private let recording: SessionRecording?

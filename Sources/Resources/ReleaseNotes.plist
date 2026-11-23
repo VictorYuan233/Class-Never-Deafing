@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.0.11</string>
+    <string>1.0.12</string>
     <key>highlights</key>
     <array>
-        <string>实时原文识别到可信句末后就按设定句数换段，定稿后校正原文并回填译文。</string>
+        <string>后续音频约每 40 毫秒发送一包，GPT-Live-Transcribe 使用 minimal 延迟模式。</string>
     </array>
 </dict>
 </plist>

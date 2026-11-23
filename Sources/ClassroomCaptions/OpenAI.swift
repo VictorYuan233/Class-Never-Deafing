@@ -110,7 +110,7 @@ final class RealtimeConnection {
 
     static func configuration(source: Language, model: TranscriptionModel) -> [String: Any] {
         var transcription: [String: Any] = ["model": model.rawValue]
-        if model == .live { transcription["delay"] = "low" }
+        if model == .live { transcription["delay"] = "minimal" }
         if source != .automatic {
             transcription["languages"] = [source.id]
         }

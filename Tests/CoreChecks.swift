@@ -205,7 +205,7 @@ struct CoreChecks {
         precondition(Language.target("zh-tw").instruction.contains("Traditional"))
         let live = transcription(for: .automatic)
         precondition(live["model"] as? String == "gpt-live-transcribe")
-        precondition(live["delay"] as? String == "low")
+        precondition(live["delay"] as? String == "minimal")
         let committed = transcription(for: .english, model: .committed)
         precondition(committed["model"] as? String == "gpt-transcribe")
         precondition(committed["delay"] == nil)
@@ -374,17 +374,20 @@ struct CoreChecks {
         let boundary = start.advanced(by: .milliseconds(200))
         yielded += batcher.append(.commit(SpeechBoundary(voicedFrames: 10, silentFrames: 3)), now: boundary)
         yielded += batcher.append(.audio(next), now: boundary.advanced(by: .milliseconds(20)))
-        precondition(yielded.count == 6)
+        precondition(yielded.count == 8)
         var beforeCommit = Data()
-        for packet in yielded.prefix(4) {
+        var sizes: [Int] = []
+        for packet in yielded.prefix(6) {
             guard case .audio(let chunk) = packet.event else { preconditionFailure("Audio order changed") }
             beforeCommit.append(chunk)
+            sizes.append(chunk.count)
         }
+        precondition(sizes == [first.count, 2 * frameSize, 2 * frameSize, 2 * frameSize, 2 * frameSize, frameSize])
         precondition(beforeCommit == first + Data(repeating: 2, count: frameSize * 9))
         precondition(yielded[1].queuedAt == start.advanced(by: .milliseconds(20)))
-        guard case .commit(let signal) = yielded[4].event else { preconditionFailure("Expected segment boundary") }
-        precondition(signal.voicedFrames == 10 && signal.silentFrames == 3 && yielded[4].queuedAt == boundary)
-        guard case .audio(let afterCommit) = yielded[5].event else { preconditionFailure("Next turn must start immediately") }
+        guard case .commit(let signal) = yielded[6].event else { preconditionFailure("Expected segment boundary") }
+        precondition(signal.voicedFrames == 10 && signal.silentFrames == 3 && yielded[6].queuedAt == boundary)
+        guard case .audio(let afterCommit) = yielded[7].event else { preconditionFailure("Next turn must start immediately") }
         precondition(afterCommit == next)
     }
 

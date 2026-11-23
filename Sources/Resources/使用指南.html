@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="app-version" content="1.0.11">
+<meta name="app-version" content="1.0.12">
 <title>Class Never Deafing 使用指南</title>
 <style>
   :root {
@@ -59,7 +59,7 @@
 <main>
   <header>
     <h1>Class Never Deafing 使用指南</h1>
-    <p class="version">适用于 1.0.11 · Apple Silicon Mac · macOS 14 或更高版本</p>
+    <p class="version">适用于 1.0.12 · Apple Silicon Mac · macOS 14 或更高版本</p>
     <p>用一个悬浮窗同时看实时原文和译文，结束后自动保存录音和双语文本。</p>
   </header>
 
@@ -122,7 +122,7 @@
     <p>沿用本节课的翻译地址和接口时，录制中可以调整翻译模型和 Fast。下一批进入翻译队列的字幕使用新配置，已经排队和正在生成的字幕沿用入队时的模型。自定义模型需填完整 ID，点「应用模型」或按回车，再进行测试。</p>
     <p>「测试转写」发送内置英文音频，「测试翻译」发送固定句子。成功时显示「测试通过」，失败时显示错误详情。可以测试尚未保存的 Key，通过后仍需点击「保存 Key」。测试可能产生 API 费用。</p>
     <ul>
-      <li><strong>转写</strong>默认使用 GPT-Live-Transcribe。两个预设通过兼容的 Realtime 接口工作。「自定义」使用兼容的 <code>audio/transcriptions</code> 接口，每段音频提交后返回原文。</li>
+      <li><strong>转写</strong>默认使用 GPT-Live-Transcribe，采用 <code>minimal</code> 延迟模式。实时音频首包直接发送，后续约每 40 毫秒发送一包。「自定义」使用兼容的 <code>audio/transcriptions</code> 接口，每段音频提交后返回原文。</li>
       <li><strong>翻译</strong>默认使用 GPT-6 Luna 和 Responses（<code>/responses</code>）。只提供聊天补全的兼容服务可选 Chat Completions（<code>/chat/completions</code>）。两种接口都支持本 App 的流式翻译，请以服务商和所选模型支持的接口为准。鼠标悬停在「翻译接口」可查看说明。</li>
       <li><strong>Fast</strong> 默认关闭。开启后，请求会附带 Fast 参数。具体支持情况及费用取决于服务商和模型。</li>
     </ul>
