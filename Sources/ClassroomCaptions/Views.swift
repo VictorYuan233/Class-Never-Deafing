@@ -79,6 +79,7 @@ struct CaptionView: View {
     @ObservedObject var preferences: Preferences
     @ObservedObject var titlebar: CaptionTitlebarLayout
     @StateObject private var scrollState = CaptionScrollState()
+    @StateObject private var markerFeedback = MarkerFeedback()
     let begin: () -> Void
     let togglePause: () -> Void
     let stop: () -> Void
@@ -128,6 +129,9 @@ struct CaptionView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: preferences.background).opacity(preferences.opacity))
         .ignoresSafeArea(.container, edges: .top)
+        .onChange(of: session.markers.last) { _, marker in
+            markerFeedback.update(confirmed: marker != nil)
+        }
     }
 
     private func toolbar(compact: Bool) -> some View {
@@ -163,8 +167,8 @@ struct CaptionView: View {
                 }
                 let markerHelp = session.markers.last.map { "添加回听标记 · 上次 \($0.line)" } ?? "添加回听标记"
                 toolbarButton(markerHelp, width: buttonWidth, enabled: listening, action: session.addMarker) {
-                    Image(systemName: session.markers.isEmpty ? "flag" : "flag.fill")
-                        .foregroundStyle(listening && !session.markers.isEmpty ? Color.orange : foreground)
+                    Image(systemName: "flag")
+                        .foregroundStyle(listening && markerFeedback.isHighlighted ? Color.yellow : foreground)
                 }
                 .accessibilityLabel("添加回听标记")
                 .accessibilityValue(session.markers.last?.line ?? "暂无标记")
@@ -351,6 +355,27 @@ struct CaptionView: View {
 private final class CaptionScrollState: ObservableObject {
     var follow = CaptionScrollFollow()
     var scheduled = false
+}
+
+@MainActor
+private final class MarkerFeedback: ObservableObject {
+    @Published private(set) var isHighlighted = false
+    private var resetTask: Task<Void, Never>?
+
+    func update(confirmed: Bool) {
+        resetTask?.cancel()
+        isHighlighted = confirmed
+        guard confirmed else {
+            resetTask = nil
+            return
+        }
+        resetTask = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(350)) }
+            catch { return }
+            self?.isHighlighted = false
+            self?.resetTask = nil
+        }
+    }
 }
 
 private struct CaptionScrollGeometry: PreferenceKey {

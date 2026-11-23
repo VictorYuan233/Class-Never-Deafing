@@ -3,11 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.0.7</string>
+    <string>1.0.8</string>
     <key>highlights</key>
     <array>
-        <string>录制中调整每批翻译句数、翻译模型和 Fast，设置用于后续译文。</string>
-        <string>录制时可点小旗添加回听标记。字幕按完整句子分批，原文持续显示。</string>
+        <string>添加回听标记时，小旗短暂变黄，随后恢复原样。</string>
     </array>
 </dict>
 </plist>
