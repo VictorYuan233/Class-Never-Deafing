@@ -66,10 +66,10 @@ struct TranscriptArchive {
         try? FileManager.default.removeItem(at: url)
     }
 
-    static func render(archived: [Entry], recent: [Entry]) -> String {
+    static func render(archived: [Entry], recent: [Entry], markers: [RecordingMarker] = []) -> String {
         var entries = Dictionary(uniqueKeysWithValues: archived.map { ($0.id, $0.text) })
         for entry in recent { entries[entry.id] = entry.text }
-        return entries.keys.sorted().compactMap { entries[$0] }.joined(separator: "\n\n") + (entries.isEmpty ? "" : "\n")
+        return TextExport.assemble(entries.keys.sorted().compactMap { entries[$0] }, markers: markers)
     }
 
     private func withDatabase<T>(flags: Int32, _ action: (OpaquePointer) throws -> T) throws -> T {

@@ -35,7 +35,7 @@ struct SoundActivity {
 struct QueuedAudioEvent {
     let event: AudioEvent
     let queuedAt: ContinuousClock.Instant
-    var recordingStartSeconds: Int64? = nil
+    var recordingSeconds: Int64? = nil
 }
 
 struct AudioPacketBatcher {
@@ -45,19 +45,19 @@ struct AudioPacketBatcher {
     private var bufferedAt: ContinuousClock.Instant?
 
     mutating func append(_ event: AudioEvent, now: ContinuousClock.Instant,
-                         recordingStartSeconds: Int64? = nil) -> [QueuedAudioEvent] {
+                         recordingSeconds: Int64? = nil) -> [QueuedAudioEvent] {
         switch event {
         case .audio(let data):
             if isFirstPacket {
                 isFirstPacket = false
-                return [QueuedAudioEvent(event: .audio(data), queuedAt: now, recordingStartSeconds: recordingStartSeconds)]
+                return [QueuedAudioEvent(event: .audio(data), queuedAt: now, recordingSeconds: recordingSeconds)]
             }
             if buffered.isEmpty { bufferedAt = now }
             buffered.append(data)
             return buffered.count >= Self.packetBytes ? flush() : []
         case .commit:
             isFirstPacket = true
-            return flush() + [QueuedAudioEvent(event: event, queuedAt: now)]
+            return flush() + [QueuedAudioEvent(event: event, queuedAt: now, recordingSeconds: recordingSeconds)]
         }
     }
 
@@ -97,7 +97,7 @@ struct SpeechSegmenter {
     private var activeFrames = 0
     private var silentFrames = 0
     private var continuing = false
-    private var processedFrames: Int64 = 0
+    private(set) var processedFrames: Int64 = 0
     private(set) var speechStartSample: Int64 = 0
     private(set) var lastRMS = 0.0
     private(set) var lastThreshold = 0.0
@@ -483,8 +483,16 @@ final class AudioProcessor: @unchecked Sendable {
         guard !events.isEmpty else { return }
         let now = ContinuousClock.now
         let startSeconds = recordingStartSample.map { ($0 + segmenter.speechStartSample) / Int64(SpeechSegmenter.sampleRate) }
+        let endSeconds = recordingStartSample.map {
+            ($0 + segmenter.processedFrames * Int64(SpeechSegmenter.samplesPerFrame)) / Int64(SpeechSegmenter.sampleRate)
+        }
         for event in events {
-            for packet in packetBatcher.append(event, now: now, recordingStartSeconds: startSeconds) {
+            let timestamp: Int64?
+            switch event {
+            case .audio: timestamp = startSeconds
+            case .commit: timestamp = endSeconds
+            }
+            for packet in packetBatcher.append(event, now: now, recordingSeconds: timestamp) {
                 if case .dropped = stream.continuation.yield(packet) {
                     AppLog.event("audio.upload.overload")
                     stream.continuation.finish(throwing: AppFailure.audioOverload)

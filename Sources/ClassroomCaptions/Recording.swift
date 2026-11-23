@@ -30,6 +30,10 @@ final class SessionRecording: @unchecked Sendable {
         self.encoder = encoder
     }
 
+    var elapsedSeconds: Int64 {
+        progress.withLock { $0.samples / Int64(SpeechSegmenter.sampleRate) }
+    }
+
     // The capture processor owns each buffer and never mutates it after submission.
     func append(_ buffer: AVAudioPCMBuffer) -> Int64 {
         let (offset, overrun) = progress.withLock { progress in

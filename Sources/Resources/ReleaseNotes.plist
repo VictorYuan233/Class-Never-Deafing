@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.0.5</string>
+    <string>1.0.7</string>
     <key>highlights</key>
     <array>
-        <string>实时字幕窗保留最近 20 分钟，开始／暂停／继续使用同一个按钮。</string>
-        <string>开启自动保存时边录边归档定稿字幕。菜单栏可分页查看本节课历史，停止后仍导出完整双语文本。</string>
+        <string>录制中调整每批翻译句数、翻译模型和 Fast，设置用于后续译文。</string>
+        <string>录制时可点小旗添加回听标记。字幕按完整句子分批，原文持续显示。</string>
     </array>
 </dict>
 </plist>

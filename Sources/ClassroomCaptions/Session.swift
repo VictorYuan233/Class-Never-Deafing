@@ -27,6 +27,12 @@ final class ClassroomSession: ObservableObject {
         let omitIfEmpty: Bool
     }
 
+    private struct TranslationContext: Equatable {
+        let source: Language
+        let target: Language
+        let captureID: UUID?
+    }
+
     private struct TranslationJob {
         let id: UUID
         let service: TranslationService
@@ -36,6 +42,9 @@ final class ClassroomSession: ObservableObject {
     @Published private(set) var phase = Phase.idle
     @Published private(set) var status = "准备就绪"
     @Published private(set) var captions: [Caption] = []
+    @Published private(set) var pendingOriginals: [Caption] = []
+    @Published private(set) var waitingText = ""
+    @Published private(set) var markers: [RecordingMarker] = []
     @Published private(set) var liveDrafts = TranscriptDrafts.Snapshot()
     @Published private(set) var notice: String?
     @Published private(set) var recordingClock = RecordingClock()
@@ -64,7 +73,12 @@ final class ClassroomSession: ObservableObject {
     private var translationRefresh: Task<Void, Never>?
     private var workers: [UUID: Task<Void, Never>] = [:]
     private var translationQueue: [TranslationJob] = []
-    private var continuationTimers: [UUID: Task<Void, Never>] = [:]
+    private var sentenceBatch = SentenceBatcher()
+    private var sentenceCount = SentenceBatcher.defaultCount
+    private var batchContext: TranslationContext?
+    private var batchTimer: Task<Void, Never>?
+    private var batchUpdatedAt = SuspendingClock().now
+    private var recording: SessionRecording?
     private var sessionTask: Task<Void, Never>?
     private var stopDeadline: Task<Void, Never>?
     private var rotation: Task<Void, Never>?
@@ -78,8 +92,8 @@ final class ClassroomSession: ObservableObject {
     private var target = Language.simplified
     private var audioInputID = AudioInput.defaultID
     private var apis: SessionAPIs?
+    private var translationTuning: TranslationTuning?
     var translationForRetry: (() throws -> TranslationService)?
-    private var segmentationLength = SegmentationLength.standard
     private var inputChanged = false
     private var resumeSignal: CheckedContinuation<Void, Never>?
     private var silencePauseMinutes: Int?
@@ -87,35 +101,52 @@ final class ClassroomSession: ObservableObject {
     private var pausedForSilence = false
 
     var canExport: Bool {
-        phase == .idle && hasHistory
+        phase == .idle && (hasHistory || !markers.isEmpty)
     }
 
     var hasHistory: Bool {
-        hasArchivedCaptions || captions.contains { $0.originalFinal && !$0.mergedIntoPrevious && !$0.original.isEmpty }
+        hasArchivedCaptions || captions.contains { !$0.original.isEmpty }
     }
 
     var visibleCaptions: [Caption] {
         return captions.filter { caption in
-            let mayHide = transcriptArchive == nil || storedPositions.contains(caption.position) ||
-                caption.mergedIntoPrevious || caption.original.isEmpty
-            return !mayHide || (caption.recordingStartSeconds ?? .max) >= visibleSince || !caption.originalFinal ||
-                caption.waitsForContinuation || caption.translationFailed ||
-                (!caption.translationFinal && !caption.mergedIntoPrevious && !caption.original.isEmpty)
+            let mayHide = caption.original.isEmpty || (caption.translationFinal &&
+                (transcriptArchive == nil || storedPositions.contains(caption.position)))
+            return !mayHide || (caption.recordingStartSeconds ?? .max) >= visibleSince
         }
     }
 
     var savedFiles: [URL] { manualExportFiles.isEmpty ? [automaticExportURL, automaticRecordingURL].compactMap { $0 } : manualExportFiles }
     var canStopAndSaveAs: Bool { [.listening, .pausing, .paused, .reconnecting].contains(phase) }
 
+    func addMarker() {
+        guard phase == .listening, let recording else { return }
+        markers.append(RecordingMarker(number: markers.count + 1, seconds: recording.elapsedSeconds))
+    }
+
+    func configureTranslation(_ tuning: TranslationTuning?) {
+        translationTuning = tuning
+        if let service = apis?.translation { apis?.translation = service.applying(tuning) }
+    }
+
+    func configureSentenceCount(_ count: Int) {
+        guard SentenceBatcher.counts.contains(count), sentenceCount != count else { return }
+        sentenceCount = count
+        AppLog.event("session.translation_sentence_count", number: count)
+        if let context = batchContext {
+            submitCompleteBatches(context: context)
+            waitingText = sentenceBatch.text
+        }
+    }
+
     func start(
         source: Language, target: Language,
-        audioInputID: String, segmentationLength: SegmentationLength,
+        audioInputID: String,
         automaticSave: Bool, retentionDays: Int,
         authorize: @escaping @MainActor () async throws -> SessionAPIs?
     ) {
         guard phase == .idle else { return }
         AppLog.event("session.start.requested")
-        AppLog.event("session.segmentation", number: segmentationLength.rawValue)
         phase = .authorizing
         status = "正在准备 API 配置…"
         notice = nil
@@ -134,7 +165,8 @@ final class ClassroomSession: ObservableObject {
                 }
                 let recording = automaticSave ? SessionRecording() : SessionRecording(
                     stagingFolder: FileManager.default.temporaryDirectory.appending(path: "Class Never Deafing"))
-                prepare(apis: apis, audioInputID: audioInputID, segmentationLength: segmentationLength)
+                prepare(apis: apis, audioInputID: audioInputID)
+                self.recording = recording
                 if automaticSave { transcriptArchive = TranscriptArchive(name: recording.name) }
                 startArchiveTimer()
                 await run(recording: recording, automaticSave: automaticSave, retentionDays: retentionDays)
@@ -150,9 +182,7 @@ final class ClassroomSession: ObservableObject {
         }
     }
 
-    private func prepare(
-        apis: SessionAPIs, audioInputID: String, segmentationLength: SegmentationLength
-    ) {
+    private func prepare(apis: SessionAPIs, audioInputID: String) {
         cancelTranslations()
         discardSavedArchive()
         transcriptArchive = nil
@@ -163,6 +193,11 @@ final class ClassroomSession: ObservableObject {
         storedPositions.removeAll()
         nextCaptionPosition = 0
         captions.removeAll()
+        pendingOriginals.removeAll()
+        markers.removeAll()
+        waitingText = ""
+        sentenceBatch = .init()
+        batchContext = nil
         indices.removeAll()
         drafts = TranscriptDrafts()
         submitted.removeAll()
@@ -176,8 +211,8 @@ final class ClassroomSession: ObservableObject {
         manualExportFiles = []
         chooseSaveCopy = nil
         self.audioInputID = audioInputID
-        self.segmentationLength = segmentationLength
         self.apis = apis
+        self.apis?.translation = apis.translation.applying(translationTuning)
         phase = .starting
         status = "正在准备音频输入…"
     }
@@ -387,7 +422,7 @@ final class ClassroomSession: ObservableObject {
                     AppLog.event("session.connection.ready")
                 }
                 guard phase != .stopping else { break }
-                let input = AudioCapture(inputID: audioInputID, length: segmentationLength, recording: recording)
+                let input = AudioCapture(inputID: audioInputID, length: .standard, recording: recording)
                 capture = input
                 status = "正在启动音频输入…"
                 let audio = try await input.start()
@@ -476,10 +511,13 @@ final class ClassroomSession: ObservableObject {
         stopDeadline?.cancel()
         stopDeadline = nil
 
+        for id in pendingOriginals.filter({ !$0.originalFinal }).map(\.id) {
+            resolveRealtime(id, text: nil)
+        }
         while !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty || !workers.isEmpty ||
-                !translationQueue.isEmpty || !continuationTimers.isEmpty {
+                !translationQueue.isEmpty || !sentenceBatch.text.isEmpty {
             if Task.isCancelled { break }
-            if recoveryWorkers.isEmpty && recoveryQueue.isEmpty { flushContinuations() }
+            if recoveryWorkers.isEmpty && recoveryQueue.isEmpty { flushSentenceBatch() }
             if phase == .stopping {
                 let pendingRecovery = !recoveryWorkers.isEmpty || !recoveryQueue.isEmpty
                 let message = pendingRecovery ? "正在处理剩余音频…" : "正在补齐译文…"
@@ -493,7 +531,7 @@ final class ClassroomSession: ObservableObject {
         if let active { retire(active) }
         active = nil
         publishOriginal()
-        flushContinuations()
+        if pendingOriginals.isEmpty { flushSentenceBatch() }
         phase = .paused
         status = pausedForSilence ? "无声超时，已自动暂停" : "已暂停"
     }
@@ -526,11 +564,9 @@ final class ClassroomSession: ObservableObject {
                     if segment == nil {
                         if service.selection != .custom { await switchSourceAtBoundary() }
                         segmentSource = active?.configuredSource ?? source
-                        let caption = Caption(position: nextCaptionPosition, recordingStartSeconds: packet.recordingStartSeconds,
+                        let caption = Caption(recordingStartSeconds: packet.recordingSeconds, translationLanguage: target,
                                               originalLanguage: segmentSource, captureID: captureID)
-                        nextCaptionPosition += 1
-                        indices[caption.id] = captions.count
-                        captions.append(caption)
+                        pendingOriginals.append(caption)
                         segment = caption.id
                     }
                     if service.selection != .committed { pcm.append(data) }
@@ -541,7 +577,10 @@ final class ClassroomSession: ObservableObject {
                     if let active { try await active.append(data) }
                 case .commit(let boundary):
                     if let id = segment {
-                        if let index = indices[id] { captions[index].translationLanguage = target }
+                        if let index = pendingIndex(id) {
+                            pendingOriginals[index].translationLanguage = target
+                            pendingOriginals[index].recordingEndSeconds = packet.recordingSeconds
+                        }
                         let audio = pcm.isEmpty ? nil : SegmentAudio(pcm: pcm, source: segmentSource)
                         rememberSubmission(id, boundary: boundary, audio: audio)
                         pcm = Data()
@@ -673,6 +712,7 @@ final class ClassroomSession: ObservableObject {
         stopDeadline?.cancel()
         stopDeadline = nil
         apis = nil
+        recording = nil
         chooseSaveCopy = nil
         sessionTask = nil
         AppLog.event("session.ended", number: Int(recordingClock.elapsed().components.seconds))
@@ -704,7 +744,7 @@ final class ClassroomSession: ObservableObject {
             drafts.bind(connection: connection, item: item, to: segment)
             scheduleOriginalRefresh()
         case .delta(let id, let text):
-            if let index = indices[id], !captions[index].originalFinal {
+            if let index = pendingIndex(id), !pendingOriginals[index].originalFinal {
                 if drafts.append(text, to: id), let segment = submitted[id] {
                     AppLog.latency("transcription.first_delta_after_commit_ms", since: segment.committedAt)
                 }
@@ -718,7 +758,7 @@ final class ClassroomSession: ObservableObject {
     }
 
     private func resolveRealtime(_ id: UUID, text: String?) {
-        guard let index = indices[id], !captions[index].originalFinal, recoveryWorkers[id] == nil,
+        guard let index = pendingIndex(id), !pendingOriginals[index].originalFinal, recoveryWorkers[id] == nil,
               !recoveryQueue.contains(where: { $0.id == id }) else { return }
         defer { publishOriginal() }
         let partial = drafts.remove(id)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -743,7 +783,7 @@ final class ClassroomSession: ObservableObject {
             AppLog.event("transcription.failed")
         }
         if let audio = segment?.audio, let service, recoveryQueue.count + recoveryWorkers.count < 12 {
-            if !partial.isEmpty { captions[index].original = partial }
+            if !partial.isEmpty { pendingOriginals[index].original = partial }
             recoveryQueue.append(Recovery(id: id, audio: audio, partial: partial, omitIfEmpty: omitIfEmpty))
             startQueuedRecovery(using: service)
         } else {
@@ -794,62 +834,103 @@ final class ClassroomSession: ObservableObject {
         }
     }
 
+    private func pendingIndex(_ id: UUID) -> Int? {
+        pendingOriginals.firstIndex { $0.id == id }
+    }
+
     private func finishOriginal(_ text: String, for id: UUID, omitIfEmpty: Bool = false) {
-        guard let index = indices[id], !captions[index].originalFinal else { return }
-        var caption = captions[index]
-        caption.original = text
-        caption.originalFinal = true
-        caption.originalFailed = text.isEmpty && !omitIfEmpty
-        captions[index] = caption
+        guard let index = pendingIndex(id), !pendingOriginals[index].originalFinal else { return }
+        var original = pendingOriginals[index]
+        original.original = text
+        original.originalFinal = true
+        original.originalFailed = text.isEmpty && !omitIfEmpty
+        pendingOriginals[index] = original
         if text.isEmpty && omitIfEmpty { AppLog.event("transcription.empty.low_signal") }
-        arrangeTranslation(at: index)
+
+        // Results can arrive out of order, particularly when a segment needs HTTP recovery.
+        while let next = pendingOriginals.first, next.originalFinal {
+            pendingOriginals.removeFirst()
+            collectSentences(from: next)
+        }
+        if pendingOriginals.isEmpty, phase == .paused { flushSentenceBatch() }
     }
 
-    private func arrangeTranslation(at index: Int) {
-        let caption = captions[index]
-        if index > 0 {
-            let previous = captions[index - 1]
-            if previous.waitsForContinuation, previous.position + 1 == caption.position {
-                if previous.translationLanguage == caption.translationLanguage,
-                   previous.originalLanguage == caption.originalLanguage,
-                   previous.captureID == caption.captureID,
-                   let joined = SentenceContinuation.joined(previous.original, caption.original) {
-                    var updated = captions
-                    updated[index - 1].original = joined
-                    updated[index].mergedIntoPrevious = true
-                    captions = updated
-                    AppLog.event("translation.continuation.merged")
-                    releaseContinuation(previous.id)
-                    return
-                }
-                releaseContinuation(previous.id)
-            }
+    private func collectSentences(from original: Caption) {
+        if original.originalFailed {
+            flushSentenceBatch()
+            appendCaption(original)
+            return
         }
-        guard !caption.original.isEmpty else { return }
-        let nextAlreadyFinal = index + 1 < captions.count &&
-            (captions[index + 1].originalFinal || captions[index + 1].position != caption.position + 1)
-        if (phase == .listening || phase == .stopping), !nextAlreadyFinal,
-           SentenceContinuation.needsMoreText(caption.original, language: caption.originalLanguage) {
-            captions[index].waitsForContinuation = true
-            continuationTimers[caption.id] = Task { [weak self] in
-                do { try await Task.sleep(for: SentenceContinuation.wait) }
-                catch { return }
-                self?.releaseContinuation(caption.id)
-            }
-        } else {
-            queueTranslation(caption.id)
+        guard !original.original.isEmpty else { return }
+        let context = TranslationContext(source: original.originalLanguage, target: original.translationLanguage,
+                                         captureID: original.captureID)
+        if batchContext != context { flushSentenceBatch() }
+        batchContext = context
+        sentenceBatch.append(original.original, at: original.recordingStartSeconds, language: context.source)
+        submitCompleteBatches(context: context)
+        if let start = sentenceBatch.startSeconds, let current = original.recordingEndSeconds ?? original.recordingStartSeconds,
+           current - start >= SentenceBatcher.maximumSeconds,
+           let batch = sentenceBatch.takeAtLimit(language: context.source) {
+            submitBatch(batch, context: context)
+        }
+        waitingText = sentenceBatch.text
+        if !waitingText.isEmpty {
+            batchUpdatedAt = SuspendingClock().now
+            armBatchTimer()
         }
     }
 
-    private func releaseContinuation(_ id: UUID) {
-        continuationTimers.removeValue(forKey: id)?.cancel()
-        guard let index = indices[id], captions[index].waitsForContinuation else { return }
-        captions[index].waitsForContinuation = false
-        queueTranslation(id)
+    private func submitCompleteBatches(context: TranslationContext) {
+        while let batch = sentenceBatch.take(count: sentenceCount, language: context.source) {
+            submitBatch(batch, context: context)
+        }
     }
 
-    private func flushContinuations() {
-        for id in Array(continuationTimers.keys) { releaseContinuation(id) }
+    private func armBatchTimer() {
+        guard batchTimer == nil else { return }
+        batchTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .milliseconds(300)) } catch { return }
+                guard let self else { return }
+                if self.finishIdleBatch() { self.batchTimer = nil; return }
+            }
+        }
+    }
+
+    private func finishIdleBatch() -> Bool {
+        guard !sentenceBatch.text.isEmpty, let context = batchContext else { return true }
+        guard pendingOriginals.isEmpty, phase != .stopping else { return false }
+        let idle = (capture?.lastHeardAt ?? batchUpdatedAt).duration(to: SuspendingClock().now)
+        if phase == .paused || idle >= .seconds(5) {
+            if let batch = sentenceBatch.flush() { submitBatch(batch, context: context) }
+        } else if idle >= .seconds(3), let batch = sentenceBatch.takeCompleted(language: context.source) {
+            submitBatch(batch, context: context)
+        }
+        waitingText = sentenceBatch.text
+        return waitingText.isEmpty
+    }
+
+    private func flushSentenceBatch() {
+        batchTimer?.cancel()
+        batchTimer = nil
+        if let context = batchContext, let batch = sentenceBatch.flush() { submitBatch(batch, context: context) }
+        batchContext = nil
+        waitingText = ""
+    }
+
+    private func submitBatch(_ batch: SentenceBatcher.Batch, context: TranslationContext) {
+        let caption = Caption(recordingStartSeconds: batch.startSeconds, original: batch.text,
+                              originalFinal: true, translationLanguage: context.target, originalLanguage: context.source)
+        appendCaption(caption)
+        queueTranslation(caption.id)
+    }
+
+    private func appendCaption(_ original: Caption) {
+        var caption = original
+        caption.position = nextCaptionPosition
+        nextCaptionPosition += 1
+        indices[caption.id] = captions.count
+        captions.append(caption)
     }
 
     private func queueTranslation(_ id: UUID) {
@@ -899,7 +980,7 @@ final class ClassroomSession: ObservableObject {
             let id = job.id
             guard let index = indices[id] else { continue }
             let original = captions[index].original
-            let previous = captions[..<index].last { $0.originalFinal && !$0.mergedIntoPrevious && !$0.original.isEmpty }?.original
+            let previous = captions[..<index].last { $0.originalFinal && !$0.original.isEmpty }?.original
             let language = captions[index].translationLanguage
             if captions[index].translationFailed {
                 captions[index].translation = ""
@@ -942,8 +1023,8 @@ final class ClassroomSession: ObservableObject {
     }
 
     private func cancelTranslations() {
-        for timer in continuationTimers.values { timer.cancel() }
-        continuationTimers.removeAll()
+        batchTimer?.cancel()
+        batchTimer = nil
         for worker in workers.values { worker.cancel() }
         workers.removeAll()
         translationQueue.removeAll()
@@ -998,11 +1079,11 @@ final class ClassroomSession: ObservableObject {
         guard evictOld, cutoff > 0 else { return }
         let context = captions.last {
             ($0.recordingStartSeconds ?? .max) < cutoff && $0.originalFinal &&
-                !$0.mergedIntoPrevious && !$0.original.isEmpty
+                !$0.original.isEmpty
         }?.id
         let old = captions.filter { caption in
             guard caption.id != context, let seconds = caption.recordingStartSeconds, seconds < cutoff else { return false }
-            return caption.mergedIntoPrevious || (caption.originalFinal && caption.original.isEmpty) ||
+            return caption.original.isEmpty ||
                 (caption.translationFinal && storedPositions.contains(caption.position))
         }
         guard !old.isEmpty else { return }
@@ -1021,8 +1102,9 @@ final class ClassroomSession: ObservableObject {
     func completeTranscript() -> Task<String, Error> {
         let recent = recentEntries()
         let archive = hasArchivedCaptions ? transcriptArchive : nil
+        let markers = markers
         return Task.detached(priority: .utility) {
-            try TranscriptArchive.render(archived: archive?.read() ?? [], recent: recent)
+            try TranscriptArchive.render(archived: archive?.read() ?? [], recent: recent, markers: markers)
         }
     }
 

@@ -74,9 +74,11 @@ final class Preferences: ObservableObject {
     @Published var audioInputID = UserDefaults.standard.string(forKey: "audioInputID") ?? AudioInput.defaultID {
         didSet { UserDefaults.standard.set(audioInputID, forKey: "audioInputID") }
     }
-    @Published var segmentationLength = (UserDefaults.standard.object(forKey: "segmentationLength") as? Int)
-        .flatMap(SegmentationLength.init(rawValue:)) ?? .standard {
-        didSet { UserDefaults.standard.set(segmentationLength.rawValue, forKey: "segmentationLength") }
+    @Published var sentencesPerTranslation = {
+        let saved = UserDefaults.standard.integer(forKey: "sentencesPerTranslation")
+        return SentenceBatcher.counts.contains(saved) ? saved : SentenceBatcher.defaultCount
+    }() {
+        didSet { UserDefaults.standard.set(sentencesPerTranslation, forKey: "sentencesPerTranslation") }
     }
     @Published var silencePauseEnabled = UserDefaults.standard.bool(forKey: "silencePauseEnabled") {
         didSet { UserDefaults.standard.set(silencePauseEnabled, forKey: "silencePauseEnabled") }
@@ -291,6 +293,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         preferences.$targetID.sink { [weak self] id in
             self?.session.selectTarget(.target(id))
         }.store(in: &subscriptions)
+        preferences.$sentencesPerTranslation.sink { [weak self] count in
+            self?.session.configureSentenceCount(count)
+        }.store(in: &subscriptions)
+        preferences.$translationModel.combineLatest(preferences.$customTranslationModelID, preferences.$fastTranslation)
+            .combineLatest(preferences.$translationAddress, preferences.$translationFormat)
+            .sink { [weak self] selection, address, format in
+                let (model, customID, fast) = selection
+                guard let endpoint = try? APIEndpoint(address),
+                      let config = try? model.configuration(customID: customID, fast: fast) else {
+                    self?.session.configureTranslation(nil)
+                    return
+                }
+                self?.session.configureTranslation(TranslationTuning(endpoint: endpoint, format: format, model: config))
+            }.store(in: &subscriptions)
         preferences.$silencePauseEnabled.combineLatest(preferences.$silencePauseMinutes).sink { [weak self] enabled, minutes in
             self?.session.configureSilencePause(minutes: enabled ? minutes : nil)
         }.store(in: &subscriptions)
@@ -427,7 +443,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         showPanel()
         session.start(
             source: .source(preferences.sourceID), target: .target(preferences.targetID),
-            audioInputID: preferences.audioInputID, segmentationLength: preferences.segmentationLength,
+            audioInputID: preferences.audioInputID,
             automaticSave: preferences.automaticSave, retentionDays: preferences.retentionDays
         ) { [weak self] in
             try await self?.authorizeStart()

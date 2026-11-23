@@ -115,7 +115,8 @@ struct CaptionView: View {
                     .padding(.horizontal, 18)
                     .padding(.top, 7)
             }
-            if session.captions.isEmpty && session.liveDrafts.unbound.isEmpty {
+            if session.captions.isEmpty && session.pendingOriginals.isEmpty &&
+                session.waitingText.isEmpty && session.liveDrafts.unbound.isEmpty {
                 Spacer(minLength: 0)
             } else {
                 transcript
@@ -160,6 +161,13 @@ struct CaptionView: View {
                         listening ? "pause.fill" : "play.fill", width: buttonWidth, enabled: canToggle) {
                     if session.phase == .idle { begin() } else { togglePause() }
                 }
+                let markerHelp = session.markers.last.map { "添加回听标记 · 上次 \($0.line)" } ?? "添加回听标记"
+                toolbarButton(markerHelp, width: buttonWidth, enabled: listening, action: session.addMarker) {
+                    Image(systemName: session.markers.isEmpty ? "flag" : "flag.fill")
+                        .foregroundStyle(listening && !session.markers.isEmpty ? Color.orange : foreground)
+                }
+                .accessibilityLabel("添加回听标记")
+                .accessibilityValue(session.markers.last?.line ?? "暂无标记")
                 control("停止", "stop.fill", width: buttonWidth,
                         enabled: session.phase != .idle && session.phase != .stopping, action: stop)
                 toolbarButton("停止并另存为", width: buttonWidth, enabled: session.canStopAndSaveAs, action: stopAndSaveAs) {
@@ -255,8 +263,23 @@ struct CaptionView: View {
                 ScrollView {
                     VStack(spacing: 0) {
                         LazyVStack(alignment: .leading, spacing: 13) {
-                            ForEach(Caption.visibleRows(session.visibleCaptions, drafts: session.liveDrafts.bound)) { caption in
+                            ForEach(Caption.visibleRows(session.visibleCaptions, drafts: [:])) { caption in
                                 captionRow(caption)
+                            }
+                            if !session.waitingText.isEmpty {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    liveOriginal(session.waitingText)
+                                    Text("等待完整句子…")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(foreground.opacity(0.65))
+                                }
+                            }
+                            ForEach(Caption.visibleRows(session.pendingOriginals, drafts: session.liveDrafts.bound)) { caption in
+                                if caption.original.isEmpty {
+                                    captionRow(caption)
+                                } else {
+                                    liveOriginal(caption.original)
+                                }
                             }
                             ForEach(session.liveDrafts.unbound) { draft in
                                 liveOriginal(draft.text)
@@ -315,7 +338,7 @@ struct CaptionView: View {
                     .font(.system(size: 12, weight: .medium))
                     .overlay(alignment: .bottom) { Rectangle().frame(height: 1).opacity(0.45) }
             } else if caption.originalFinal && !caption.original.isEmpty {
-                Text(caption.waitsForContinuation ? "等待续句…" : "正在翻译…")
+                Text("正在翻译…")
                     .font(.system(size: 12))
                     .foregroundStyle(foreground.opacity(0.65))
             }
@@ -454,6 +477,11 @@ final class APIKeySettings: ObservableObject {
 
 struct SettingsView: View {
     @StateObject private var help = SettingsHelp()
+    private final class TranslationModelDraft: ObservableObject {
+        @Published var text: String?
+    }
+
+    @StateObject private var translationDraft = TranslationModelDraft()
     @ObservedObject var preferences: Preferences
     @ObservedObject var transcriptionKey: APIKeySettings
     @ObservedObject var translationKey: APIKeySettings
@@ -462,6 +490,22 @@ struct SettingsView: View {
     let revealDiagnostics: () -> Void
     let openGuide: () -> Void
     let openAbout: () -> Void
+
+    private var pendingCustomTranslationModel: Bool {
+        preferences.translationModel == .custom &&
+            (translationDraft.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? preferences.customTranslationModelID) != preferences.customTranslationModelID
+    }
+
+    private var canApplyCustomTranslationModel: Bool {
+        pendingCustomTranslationModel &&
+            (try? TranslationModel.custom.configuration(customID: translationDraft.text ?? "")) != nil
+    }
+
+    private func applyCustomTranslationModel() {
+        guard canApplyCustomTranslationModel, let draft = translationDraft.text else { return }
+        preferences.customTranslationModelID = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        translationDraft.text = nil
+    }
 
     var body: some View {
         Form {
@@ -483,21 +527,20 @@ struct SettingsView: View {
             }
             Section("分句") {
                 Slider(value: Binding(
-                    get: { Double(preferences.segmentationLength.rawValue) },
-                    set: { value in
-                        if let length = SegmentationLength(rawValue: Int(value.rounded())) {
-                            preferences.segmentationLength = length
-                        }
-                    }
-                ), in: Double(SegmentationLength.short.rawValue)...Double(SegmentationLength.extended.rawValue), step: 1) {
-                    Text("分句长短")
+                    get: { Double(preferences.sentencesPerTranslation) },
+                    set: { preferences.sentencesPerTranslation = Int($0.rounded()) }
+                ), in: Double(SentenceBatcher.counts.lowerBound)...Double(SentenceBatcher.counts.upperBound), step: 1) {
+                    Text("每批翻译句数")
                 } minimumValueLabel: {
-                    Text("短")
+                    Text("1 句")
                 } maximumValueLabel: {
-                    Text("长")
+                    Text("5 句")
                 }
-                .accessibilityValue(preferences.segmentationLength.title)
-                .settingsHelp("\(preferences.segmentationLength.detail)。下次开始转写时生效。")
+                .accessibilityValue("\(preferences.sentencesPerTranslation) 句")
+                .settingsHelp("录制中调整立即生效。已凑齐的完整句子可立即提交，原文继续显示。")
+                Text("当前 \(preferences.sentencesPerTranslation) 句 · 默认 1 句")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
             }
             Section("自动暂停") {
                 Toggle("无声时自动暂停", isOn: $preferences.silencePauseEnabled)
@@ -597,18 +640,30 @@ struct SettingsView: View {
                                         label: \.label)
                         .fixedSize()
                 }
-                .onChange(of: preferences.translationModel) { _, _ in translationKey.clearTest() }
-                .settingsHelp("选择生成译文的模型。服务商提供其他模型时，可选「自定义」。")
+                .onChange(of: preferences.translationModel) { _, _ in
+                    translationDraft.text = nil
+                    translationKey.clearTest()
+                }
+                .settingsHelp("沿用本节课的翻译地址和接口时，新模型从下一批待提交字幕生效。")
                 if preferences.translationModel == .custom {
-                    TextField("翻译模型 ID", text: $preferences.customTranslationModelID, prompt: Text("例如 gpt-6-luna"))
-                        .onChange(of: preferences.customTranslationModelID) { _, _ in translationKey.clearTest() }
-                        .settingsHelp("输入服务商提供的文本模型 ID，再点「测试翻译」。")
+                    TextField("翻译模型 ID", text: Binding(
+                        get: { translationDraft.text ?? preferences.customTranslationModelID },
+                        set: { draft in
+                            translationDraft.text = draft
+                            translationKey.clearTest()
+                        }
+                    ), prompt: Text("例如 gpt-6-luna"))
+                    .onSubmit(applyCustomTranslationModel)
+                    .settingsHelp("输入服务商提供的模型 ID，再点「应用模型」或按回车。")
+                    Button("应用模型", action: applyCustomTranslationModel)
+                        .disabled(!canApplyCustomTranslationModel)
+                        .settingsHelp("使用填好的模型 ID 提交之后的译文，并可测试新模型。")
                 }
                 Toggle("翻译 Fast 模式", isOn: preferences.translationModel.allowsFast ? $preferences.fastTranslation : .constant(false))
                     .disabled(!preferences.translationModel.allowsFast)
                     .onChange(of: preferences.fastTranslation) { _, _ in translationKey.clearTest() }
-                    .settingsHelp("默认关闭。开启时会请求 Fast，支持情况与费用取决于所选模型和服务商。")
-                apiControls(translationKey)
+                    .settingsHelp("默认关闭。打开时从下一批待提交字幕开始请求 Fast，支持情况和费用取决于所选模型和服务商。")
+                apiControls(translationKey, canTest: !pendingCustomTranslationModel)
             }
             Section("快捷键") {
                 ForEach(CaptionShortcutAction.allCases) { action in
@@ -661,7 +716,7 @@ struct SettingsView: View {
     }
 
     @ViewBuilder
-    private func apiControls(_ key: APIKeySettings) -> some View {
+    private func apiControls(_ key: APIKeySettings, canTest: Bool = true) -> some View {
         SecureField("\(key.role.title) API Key", text: Binding(get: { key.entry }, set: { key.entry = $0 }),
                     prompt: Text(key.hasSavedKey ? "输入新 Key 以替换" : "粘贴 API Key"))
             .onSubmit { if key.hasEntry { key.save(preferences) } }
@@ -681,7 +736,8 @@ struct SettingsView: View {
             Button(key.isTesting ? "取消测试" : "测试\(key.role.title)") {
                 if key.isTesting { key.clearTest() } else { key.test(preferences) }
             }
-            .settingsHelp(key.isTesting ? "取消本次测试请求。" : key.role == .transcription
+            .disabled(!canTest && !key.isTesting)
+            .settingsHelp(!canTest ? "先应用自定义模型，再测试翻译。" : key.isTesting ? "取消本次测试请求。" : key.role == .transcription
                   ? "发送内置音频样例，测试可能计费。"
                   : "发送一句固定文本测试翻译，测试可能计费。")
         }

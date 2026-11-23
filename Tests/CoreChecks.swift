@@ -9,6 +9,7 @@ struct CoreChecks {
         try checkTranslationConfiguration()
         try checkSubtitleColors()
         try checkAPISettings()
+        try checkLiveTranslationTuning()
         try checkLogRetention()
         checkSpeechBoundaries()
         checkQuietMicrophone()
@@ -24,12 +25,12 @@ struct CoreChecks {
         checkCaptionScroll()
         checkRecordingClock()
         try checkExport()
-        checkSentenceContinuation()
+        checkSentenceBatches()
         try checkPrivateDataLocation()
         try checkExportArchive()
         try checkTranscriptArchive()
         try await checkSessionRecording()
-        print("通过：独立 API 地址与密钥、密钥加密和错误脱敏、翻译与转写请求、字幕窗快捷键、诊断日志、音频分段、字幕录音配对保存。")
+        print("通过：独立 API 地址与密钥、密钥加密和错误脱敏、翻译与转写请求、字幕窗快捷键、诊断日志、音频分段、整句翻译分组、翻译热更新、回听标记与字幕录音配对保存。")
     }
 
     private static func checkTranscriptDrafts() {
@@ -505,26 +506,60 @@ struct CoreChecks {
         }
     }
 
-    private static func checkSentenceContinuation() {
-        let first = "If interest rates stay high."
-        let second = "companies may put off new investments."
-        precondition(SentenceContinuation.needsMoreText(first, language: .automatic))
-        precondition(SentenceContinuation.needsMoreText("The method works because.", language: .english))
-        precondition(!SentenceContinuation.needsMoreText("If inflation rises, we will respond.", language: .english))
-        precondition(!SentenceContinuation.needsMoreText("The answer is 3.14.", language: .automatic))
-        precondition(!SentenceContinuation.needsMoreText(first, language: .simplified))
-        precondition(SentenceContinuation.joined(first, "Next, we'll discuss GDP.") == nil)
-        precondition(SentenceContinuation.joined(first, "我们来看看下一题。") == nil)
-        precondition(SentenceContinuation.joined("This works because.", "it is faster.") == "This works because it is faster.")
-        let merged = SentenceContinuation.joined(first, second)!
-        precondition(merged == "If interest rates stay high, companies may put off new investments.")
-        let captions = [
-            Caption(recordingStartSeconds: 12, original: merged, translation: "如果利率持续走高，企业可能会推迟新的投资。",
-                    originalFinal: true, translationFinal: true),
-            Caption(recordingStartSeconds: 14, original: second, originalFinal: true, mergedIntoPrevious: true),
-        ]
-        precondition(Caption.visibleRows(captions, drafts: [:]).count == 1)
-        precondition(TextExport.render(captions) == "[00:00:12] \(merged)\n如果利率持续走高，企业可能会推迟新的投资。\n")
+    private static func checkSentenceBatches() {
+        let english = Language.english
+        var batcher = SentenceBatcher()
+        batcher.append("If interest rates stay high.", at: 12, language: english)
+        precondition(batcher.take(count: 1, language: english) == nil)
+        batcher.append("companies may delay investment. Dr. Tan reviews the U.S. data at 3.14. We also", at: 14, language: english)
+        precondition(batcher.take(count: 5, language: english) == nil)
+        let first = batcher.take(count: 2, language: english)
+        precondition(first?.text == "If interest rates stay high, companies may delay investment. Dr. Tan reviews the U.S. data at 3.14.")
+        precondition(first?.startSeconds == 12 && batcher.text == "We also" && batcher.startSeconds == 14)
+        batcher.append("consider inflation. Ready?", at: 18, language: english)
+        let second = batcher.take(count: 1, language: english)
+        precondition(second?.text == "We also consider inflation." && second?.startSeconds == 14)
+        precondition(batcher.take(count: 1, language: english)?.startSeconds == 18 && batcher.text.isEmpty)
+
+        batcher.append("The method works because.", at: 25, language: .automatic)
+        precondition(batcher.take(count: 1, language: .automatic) == nil)
+        batcher.append("it is faster.", at: 27, language: .automatic)
+        precondition(batcher.take(count: 1, language: .automatic)?.text == "The method works because it is faster.")
+
+        batcher.append("准备好了", at: 30, language: .simplified)
+        batcher.append("吗？可以了。继续讲", at: 31, language: .simplified)
+        precondition(batcher.take(count: 5, language: .simplified) == nil)
+        precondition(batcher.takeCompleted(language: .simplified)?.text == "准备好了吗？可以了。")
+        precondition(batcher.flush()?.text == "继续讲" && batcher.flush() == nil)
+
+        let french = Language.source("fr")
+        batcher.append("Le café", at: 40, language: french)
+        batcher.append("était bon.", at: 41, language: french)
+        precondition(batcher.take(count: 1, language: french)?.text == "Le café était bon.")
+
+        batcher.append("The instructor introduces a long example without a full stop, and continues explaining", at: 60, language: english)
+        precondition(batcher.takeAtLimit(language: english)?.text == "The instructor introduces a long example without a full stop,")
+        precondition(batcher.flush()?.text == "and continues explaining")
+    }
+
+    private static func checkLiveTranslationTuning() throws {
+        let activeEndpoint = try APIEndpoint("https://example.invalid/v1")
+        let newEndpoint = try APIEndpoint("https://new.example.invalid/v1")
+        let connection = APIConnection(endpoint: activeEndpoint, key: "fixture")
+        let initial = try TranslationModel.luna.configuration()
+        let next = try TranslationModel.sol.configuration(fast: true)
+        let service = TranslationService(connection: connection, format: .responses, model: initial)
+        let optedIn = service.applying(TranslationTuning(endpoint: activeEndpoint, format: .responses, model: next))
+        precondition(service.model == initial && optedIn.model == next && optedIn.model.serviceTier == "fast")
+        precondition(optedIn.connection.endpoint == activeEndpoint && optedIn.connection.key == "fixture" && optedIn.format == .responses)
+
+        let wrongRoute = TranslationTuning(endpoint: newEndpoint, format: .responses, model: initial)
+        let wrongFormat = TranslationTuning(endpoint: activeEndpoint, format: .chat, model: initial)
+        precondition(optedIn.applying(nil).model == next)
+        precondition(optedIn.applying(wrongRoute).model == next && optedIn.applying(wrongFormat).model == next)
+        let custom = try TranslationModel.custom.configuration(customID: "provider/model")
+        let optedOut = optedIn.applying(TranslationTuning(endpoint: activeEndpoint, format: .responses, model: custom))
+        precondition(optedOut.model.id == "provider/model" && optedOut.model.serviceTier == nil)
     }
 
     private static func checkExportArchive() throws {
@@ -589,6 +624,14 @@ struct CoreChecks {
         let output = TranscriptArchive.render(archived: archived, recent: [revised])
         precondition(output.hasPrefix("[00:00:00] Caption number 0.") && output.hasSuffix("Final caption.\n结尾。\n"))
         precondition(output.components(separatedBy: "\n\n").count == intervals)
+        let marks = [RecordingMarker(number: 1, seconds: 2), RecordingMarker(number: 2, seconds: 2),
+                     RecordingMarker(number: 3, seconds: 12600)]
+        let marked = TranscriptArchive.render(archived: archived, recent: [revised], markers: marks)
+        precondition(marked.hasPrefix("回听标记\n[00:00:02] 标记 1\n[00:00:02] 标记 2\n[03:30:00] 标记 3"))
+        precondition(marked.contains("字幕 0。\n\n[00:00:02] 标记 1\n\n[00:00:02] 标记 2\n\n[00:00:05] Caption number 1."))
+        precondition(marked.hasSuffix("结尾。\n\n[03:30:00] 标记 3\n"))
+        precondition(TranscriptArchive.render(archived: [], recent: [], markers: [marks[0]])
+            .contains("[00:00:02] 标记 1\n"))
         archive.discard()
         precondition(!FileManager.default.fileExists(atPath: archive.url.path))
         precondition((try? archive.read()) == nil)
@@ -620,12 +663,14 @@ struct CoreChecks {
 
         // Two captures model pause and resume. The recording includes audio before the speech gate.
         let silentPackets = try await capture(0, frames: 28_800, using: recording)
+        precondition(recording.elapsedSeconds == 1)
         let speechPackets = try await capture(1200, using: recording)
         precondition(silentPackets.isEmpty)
-        precondition(speechPackets.compactMap(\.recordingStartSeconds) == [1])
+        precondition(speechPackets.compactMap(\.recordingSeconds) == [1, 1])
+        precondition(recording.elapsedSeconds == 1)
         let outcome = await recording.finish(to: destination)
         guard let url = outcome.url, outcome.warning == nil else { preconditionFailure("Recording did not save") }
-        let caption = Caption(recordingStartSeconds: speechPackets.first?.recordingStartSeconds,
+        let caption = Caption(recordingStartSeconds: speechPackets.first?.recordingSeconds,
                               original: "Hello.", translation: "你好。", originalFinal: true, translationFinal: true)
         let content = TextExport.render([caption])
         precondition(content == "[00:00:01] Hello.\n你好。\n")
