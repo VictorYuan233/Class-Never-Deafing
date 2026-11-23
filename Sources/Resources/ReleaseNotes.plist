@@ -3,10 +3,10 @@
 <plist version="1.0">
 <dict>
     <key>version</key>
-    <string>1.1.0</string>
+    <string>1.1.1</string>
     <key>highlights</key>
     <array>
-        <string>字幕窗底部实时生成的段落只显示原文，下一段开始后才为上一段生成译文草稿。</string>
+        <string>显示和隐藏字幕窗共用一个可自定义的全局快捷键，隐藏期间继续转写和计时。</string>
     </array>
 </dict>
 </plist>

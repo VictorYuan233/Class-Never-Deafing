@@ -331,10 +331,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             self?.session.exportFolder = folder
         }.store(in: &subscriptions)
         observeAudioDevices()
-        shortcuts.start { [weak self] action in
-            switch action {
-            case .show: self?.showPanel()
-            case .hide: self?.hidePanel()
+        shortcuts.start { [weak self] in
+            guard let self else { return }
+            if self.panel?.isVisible == true {
+                self.hidePanel()
+            } else {
+                self.showPanel()
             }
         }
         NotificationCenter.default.addObserver(self, selector: #selector(fitPanelOnScreen), name: NSApplication.didChangeScreenParametersNotification, object: nil)

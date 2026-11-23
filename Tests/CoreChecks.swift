@@ -229,7 +229,7 @@ struct CoreChecks {
         precondition(committed["languages"] as? [String] == ["en"])
     }
 
-    private static func checkCaptionShortcuts() throws {
+    @MainActor private static func checkCaptionShortcuts() throws {
         let show = CaptionKeyCombination(keyCode: 15, flags: [.command, .option], characters: "r")!
         let localized = CaptionKeyCombination(keyCode: 15, flags: [.command, .option], characters: "p")!
         let hide = CaptionKeyCombination(keyCode: 15, flags: [.command, .control], characters: "r")!
@@ -239,6 +239,24 @@ struct CoreChecks {
         precondition(CaptionKeyCombination(keyCode: 15, flags: [.shift], characters: "R") == nil)
         let restored = try PropertyListDecoder().decode(CaptionKeyCombination.self, from: PropertyListEncoder().encode(show))
         precondition(restored == show)
+
+        let suite = "ClassNeverDeafing.ShortcutChecks.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let encoder = PropertyListEncoder()
+        let showKey = "captionWindowShowShortcut"
+        let hideKey = "captionWindowHideShortcut"
+        let toggleKey = "captionWindowToggleShortcut"
+
+        defaults.set(try encoder.encode(hide), forKey: hideKey)
+        precondition(CaptionShortcuts(defaults: defaults).combination == hide)
+        defaults.set(try encoder.encode(show), forKey: showKey)
+        precondition(CaptionShortcuts(defaults: defaults).combination == hide)
+        defaults.removeObject(forKey: toggleKey)
+        let migrated = CaptionShortcuts(defaults: defaults)
+        precondition(migrated.combination == show)
+        migrated.clear()
+        precondition(CaptionShortcuts(defaults: defaults).combination == nil)
     }
 
     private static func checkTranslationConfiguration() throws {

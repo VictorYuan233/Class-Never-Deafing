@@ -821,22 +821,20 @@ struct SettingsView: View {
                 apiControls(translationKey, canTest: !pendingCustomTranslationModel)
             }
             Section("快捷键") {
-                ForEach(CaptionShortcutAction.allCases) { action in
-                    LabeledContent(action.title) {
-                        HStack {
-                            let isRecording = shortcuts.recording == action
-                            let shortcut = shortcuts.combinations[action]
-                            Button(isRecording ? "请按快捷键…" : shortcut?.display ?? "录制快捷键") {
-                                shortcuts.beginRecording(action)
-                            }
-                            .accessibilityLabel("\(action.title)快捷键")
-                            .accessibilityValue(isRecording ? "等待输入" : shortcut?.display ?? "未设置")
-                            .settingsHelp(isRecording ? "按 Esc 可取消录制。" : "设定后可在其他 App 中使用。")
-                            if shortcut != nil {
-                                Button("清除") { shortcuts.clear(action) }
-                                    .accessibilityLabel("清除\(action.title)快捷键")
-                                    .settingsHelp("移除当前快捷键组合。")
-                            }
+                LabeledContent("显示／隐藏字幕窗") {
+                    HStack {
+                        let isRecording = shortcuts.isRecording
+                        let shortcut = shortcuts.combination
+                        Button(isRecording ? "请按快捷键…" : shortcut?.display ?? "录制快捷键") {
+                            shortcuts.beginRecording()
+                        }
+                        .accessibilityLabel("显示／隐藏字幕窗快捷键")
+                        .accessibilityValue(isRecording ? "等待输入" : shortcut?.display ?? "未设置")
+                        .settingsHelp(isRecording ? "按 Esc 可取消录制。" : "用同一个组合显示或隐藏字幕窗，在其他 App 中也可使用。")
+                        if shortcut != nil {
+                            Button("清除") { shortcuts.clear() }
+                                .accessibilityLabel("清除显示／隐藏字幕窗快捷键")
+                                .settingsHelp("移除当前快捷键组合。")
                         }
                     }
                 }

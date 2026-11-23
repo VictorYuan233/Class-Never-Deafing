@@ -2,15 +2,6 @@ import AppKit
 import Carbon
 import Combine
 
-enum CaptionShortcutAction: UInt32, CaseIterable, Identifiable {
-    case show = 1
-    case hide = 2
-
-    var id: UInt32 { rawValue }
-    var title: String { self == .show ? "显示字幕窗" : "隐藏字幕窗" }
-    var defaultsKey: String { self == .show ? "captionWindowShowShortcut" : "captionWindowHideShortcut" }
-}
-
 struct CaptionKeyCombination: Codable, Equatable {
     let keyCode: UInt32
     let modifiers: UInt32
@@ -63,28 +54,33 @@ struct CaptionKeyCombination: Codable, Equatable {
 @MainActor
 final class CaptionShortcuts: ObservableObject {
     nonisolated private static let signature: OSType = 0x434e4446
+    nonisolated private static let hotKeyID: UInt32 = 1
+    private static let defaultsKey = "captionWindowToggleShortcut"
+    private static let legacyKeys = ["captionWindowShowShortcut", "captionWindowHideShortcut"]
 
-    @Published private(set) var combinations: [CaptionShortcutAction: CaptionKeyCombination] = [:]
-    @Published private(set) var recording: CaptionShortcutAction?
+    @Published private(set) var combination: CaptionKeyCombination?
+    @Published private(set) var isRecording = false
     @Published private(set) var message: String?
 
     private let defaults: UserDefaults
-    private var registrations: [CaptionShortcutAction: EventHotKeyRef] = [:]
+    private var registration: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
     private var keyMonitor: Any?
-    private var onPress: ((CaptionShortcutAction) -> Void)?
+    private var onPress: (() -> Void)?
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        for action in CaptionShortcutAction.allCases {
-            if let data = defaults.data(forKey: action.defaultsKey),
-               let shortcut = try? PropertyListDecoder().decode(CaptionKeyCombination.self, from: data) {
-                combinations[action] = shortcut
-            }
+        let decoder = PropertyListDecoder()
+        for key in [Self.defaultsKey] + Self.legacyKeys {
+            guard let data = defaults.data(forKey: key),
+                  let shortcut = try? decoder.decode(CaptionKeyCombination.self, from: data) else { continue }
+            combination = shortcut
+            if key != Self.defaultsKey { defaults.set(data, forKey: Self.defaultsKey) }
+            break
         }
     }
 
-    func start(onPress: @escaping (CaptionShortcutAction) -> Void) {
+    func start(onPress: @escaping () -> Void) {
         self.onPress = onPress
         var type = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         let status = InstallEventHandler(GetEventDispatcherTarget(), { _, event, context in
@@ -94,57 +90,57 @@ final class CaptionShortcuts: ObservableObject {
                                          EventParamType(typeEventHotKeyID), nil,
                                          MemoryLayout<EventHotKeyID>.size, nil, &id)
             guard read == noErr, id.signature == CaptionShortcuts.signature,
-                  let action = CaptionShortcutAction(rawValue: id.id) else { return OSStatus(eventNotHandledErr) }
+                  id.id == CaptionShortcuts.hotKeyID else { return OSStatus(eventNotHandledErr) }
             let shortcuts = Unmanaged<CaptionShortcuts>.fromOpaque(context).takeUnretainedValue()
             Task { @MainActor in
-                if shortcuts.recording == nil, shortcuts.registrations[action] != nil {
-                    shortcuts.onPress?(action)
+                if !shortcuts.isRecording, shortcuts.registration != nil {
+                    shortcuts.onPress?()
                 }
             }
             return noErr
         }, 1, &type, Unmanaged.passUnretained(self).toOpaque(), &eventHandler)
         if status == noErr {
-            restoreRegistrations()
+            restoreRegistration()
         } else {
             message = "无法启用全局快捷键（\(status)）。"
         }
     }
 
-    func beginRecording(_ action: CaptionShortcutAction) {
-        if recording == action {
+    func beginRecording() {
+        if isRecording {
             cancelRecording()
             return
         }
-        stopMonitoring()
-        unregisterAll()
+        unregister()
         message = nil
-        recording = action
+        isRecording = true
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, let action = self.recording else { return event }
-            self.record(event, for: action)
+            guard let self, self.isRecording else { return event }
+            self.record(event)
             return nil
         }
     }
 
-    func clear(_ action: CaptionShortcutAction) {
+    func clear() {
         stopMonitoring()
-        if let reference = registrations.removeValue(forKey: action) { UnregisterEventHotKey(reference) }
-        combinations.removeValue(forKey: action)
-        defaults.removeObject(forKey: action.defaultsKey)
+        unregister()
+        combination = nil
+        for key in [Self.defaultsKey] + Self.legacyKeys {
+            defaults.removeObject(forKey: key)
+        }
         message = nil
-        restoreRegistrations()
     }
 
     func cancelRecording() {
-        guard recording != nil else { return }
+        guard isRecording else { return }
         stopMonitoring()
         message = nil
-        restoreRegistrations()
+        restoreRegistration()
     }
 
     func shutdown() {
         stopMonitoring()
-        unregisterAll()
+        unregister()
         if let eventHandler {
             RemoveEventHandler(eventHandler)
             self.eventHandler = nil
@@ -152,7 +148,7 @@ final class CaptionShortcuts: ObservableObject {
         onPress = nil
     }
 
-    private func record(_ event: NSEvent, for action: CaptionShortcutAction) {
+    private func record(_ event: NSEvent) {
         guard !event.isARepeat else { return }
         let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
         if Int(event.keyCode) == kVK_Escape, flags.isEmpty {
@@ -164,52 +160,47 @@ final class CaptionShortcuts: ObservableObject {
             message = "请按带有 ⌘、⌥ 或 ⌃ 的组合键，或按一个功能键。"
             return
         }
-        if combinations.contains(where: { $0.key != action && $0.value.matches(shortcut) }) {
-            message = "显示和隐藏字幕窗需使用不同的快捷键。"
-            return
-        }
-        guard register(shortcut, for: action) else { return }
-        combinations[action] = shortcut
+        guard register(shortcut) else { return }
+        combination = shortcut
         if let data = try? PropertyListEncoder().encode(shortcut) {
-            defaults.set(data, forKey: action.defaultsKey)
+            defaults.set(data, forKey: Self.defaultsKey)
         }
         stopMonitoring()
         message = nil
-        restoreRegistrations()
     }
 
-    private func register(_ shortcut: CaptionKeyCombination, for action: CaptionShortcutAction) -> Bool {
+    private func register(_ shortcut: CaptionKeyCombination) -> Bool {
         guard eventHandler != nil else {
             message = "全局快捷键服务未能启用。"
             return false
         }
         var reference: EventHotKeyRef?
-        let id = EventHotKeyID(signature: Self.signature, id: action.rawValue)
+        let id = EventHotKeyID(signature: Self.signature, id: Self.hotKeyID)
         let status = RegisterEventHotKey(shortcut.keyCode, shortcut.modifiers, id, GetEventDispatcherTarget(),
                                          OptionBits(kEventHotKeyExclusive), &reference)
         guard status == noErr, let reference else {
             if status == eventHotKeyExistsErr {
-                message = "\(shortcut.display) 已被占用，请为「\(action.title)」选择其他快捷键。"
+                message = "\(shortcut.display) 已被占用，请选择其他快捷键。"
             } else {
-                message = "无法启用「\(action.title)」快捷键（\(status)），请换一个组合。"
+                message = "无法启用「显示／隐藏字幕窗」快捷键（\(status)），请换一个组合。"
             }
             return false
         }
-        registrations[action] = reference
+        registration = reference
         return true
     }
 
-    private func restoreRegistrations() {
-        for action in CaptionShortcutAction.allCases {
-            if registrations[action] == nil, let shortcut = combinations[action] {
-                _ = register(shortcut, for: action)
-            }
+    private func restoreRegistration() {
+        if registration == nil, let combination {
+            _ = register(combination)
         }
     }
 
-    private func unregisterAll() {
-        for reference in registrations.values { UnregisterEventHotKey(reference) }
-        registrations.removeAll()
+    private func unregister() {
+        if let registration {
+            UnregisterEventHotKey(registration)
+            self.registration = nil
+        }
     }
 
     private func stopMonitoring() {
@@ -217,6 +208,6 @@ final class CaptionShortcuts: ObservableObject {
             NSEvent.removeMonitor(keyMonitor)
             self.keyMonitor = nil
         }
-        recording = nil
+        isRecording = false
     }
 }
